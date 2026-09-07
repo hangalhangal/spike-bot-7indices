@@ -1,3 +1,23 @@
+# ===== RENDER WEB SERVICE PORT FIX - 18 МӨР НЭМЭВ =====
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot Running OK - AI MANIAC")
+    def log_message(self, *args): return
+
+def run_keep_alive():
+    port = int(os.environ.get("PORT", 10000))
+    httpd = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
+    print(f"HTTP server listening on 0.0.0.0:{port}")
+    httpd.serve_forever()
+threading.Thread(target=run_keep_alive, daemon=True).start()
+
+# ===== ORIGINAL BOT CODE (ХӨНДӨӨГҮЙ) =====
 import os
 import asyncio
 import json
@@ -35,7 +55,8 @@ DERIV_MAP = {
 
 # AI МАНГАС САНАМЖ - өөрөө хөгждөг
 price_history = {name: deque(maxlen=500) for name in INDICES}
-active_subscriptions = {}
+active_subscriptions = {}  # chat_id -> set(indices)
+user_apps = {}  # chat_id -> app
 
 keyboard = [
     ["Boom 1000 Index", "Crash 1000 Index"],
@@ -71,10 +92,13 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_index(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     msg = update.message.text.strip()
+    
     if msg not in INDICES:
         return
+    
     if chat_id not in active_subscriptions:
         active_subscriptions[chat_id] = set()
+    
     if msg in active_subscriptions[chat_id]:
         active_subscriptions[chat_id].remove(msg)
         await update.message.reply_text(f"❌ {msg} унтраалаа", reply_markup=reply_markup)
@@ -83,9 +107,11 @@ async def handle_index(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ {msg} идэвхжлээ!\n"
             f"🧠 AI мангас {msg} дээр сурч эхэллээ...\n"
-            f"Drift 0.3% хүрмэгц дохио ирнэ!",
+            f"Drift 0.3% хүрмэгц дохио ирнэ!\n"
+            f"Ticks цуглуулж байна...",
             reply_markup=reply_markup
         )
+        # Дервив холболт эхлүүлнэ
         asyncio.create_task(deriv_watcher(msg, context))
 
 async def deriv_watcher(index_name, context):
@@ -99,19 +125,29 @@ async def deriv_watcher(index_name, context):
                 if "tick" in data:
                     price = data["tick"]["quote"]
                     price_history[index_name].append(price)
+                    
+                    # AI МАНГАС ЛОГИК: Drift тооцох
                     if len(price_history[index_name]) >= 100:
                         old_price = price_history[index_name][0]
                         drift = abs(price - old_price) / old_price * 100
                         ticks = len(price_history[index_name])
+                        
+                        # 0.3% Drift + Ticks 400+ = Spike магадлал өндөр
                         if drift >= 0.3 and ticks >= 200:
                             for chat_id, subs in active_subscriptions.items():
                                 if index_name in subs:
                                     try:
                                         await context.bot.send_message(
                                             chat_id=chat_id,
-                                            text=f"⚠️ PREDICTIVE MANIAC\n{symbol}\nTicks:{ticks}\nPrice:{price}\nDrift {drift:.2f}% ✅\nAI МАНГАС ДОХИО - {index_name} SPIKE удахгүй! 🧠",
+                                            text=f"⚠️ PREDICTIVE MANIAC\n"
+                                                 f"{symbol}\n"
+                                                 f"Ticks:{ticks}\n"
+                                                 f"Price:{price}\n"
+                                                 f"Drift {drift:.2f}% ✅\n"
+                                                 f"AI МАНГАС ДОХИО - {index_name} SPIKE удахгүй! 🧠",
                                             reply_markup=reply_markup
                                         )
+                                        # Давхардахгүй тулд бага зэрэг хүлээх
                                         await asyncio.sleep(30)
                                     except Exception as e:
                                         logging.error(f"Send error: {e}")
