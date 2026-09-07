@@ -3,22 +3,28 @@ import websocket
 import json
 import time
 import requests
-from collections import deque
+from collections import deque, defaultdict
 from flask import Flask
 import threading
 
-# ===== RENDER PORT BINDING - ЭНЭ БАЙХ ЁСТОЙ, УСТГАЖ БОЛОХГҮЙ =====
+# ===== RENDER PORT BINDING - БАЙХ ЁСТОЙ =====
 app = Flask(__name__)
+
 @app.route('/')
 def home():
-    return "7 Indices Bot Running - Boom Crash Monitoring Active"
+    return "7 Indices Bot Running - Boom Crash Monitoring Live"
 
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+# ===== TELEGRAM =====
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-threading.Thread(target=run_web, daemon=True).start()
-# ===== PORT BINDING DUUSAV =====
+def send_telegram(msg):
+    try:
+        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+    except Exception as e:
+        print(f"Telegram Error: {e}")
 
 # ===== ТАНЫ 7 ИНДЕКС - ӨӨРЧЛӨӨГҮЙ =====
 INDICES = {
@@ -31,58 +37,32 @@ INDICES = {
     "CRASH900": "CRASH_900"
 }
 
-# ===== TELEGRAM - RENDER ENV-EES УНШИНА =====
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-# ===== ТАНЫ REDLINE + 1 MIN SPIKE LOGIC - ӨӨРЧЛӨӨГҮЙ =====
-ticks = {k: deque(maxlen=60) for k in INDICES.keys()}
-
-def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram Token/Chat ID not set")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
-        print(f"Sent: {msg[:50]}")
-    except Exception as e:
-        print(f"Telegram Error: {e}")
+ticks = defaultdict(lambda: deque(maxlen=10))
 
 def on_message(ws, message):
     try:
         data = json.loads(message)
-        if 'tick' not in data:
-            return
+        if 'tick' in data:
+            tick = data['tick']
+            symbol = tick['symbol']
+            price = float(tick['quote'])
+            index_name = symbol
+            
+            old_price = ticks[index_name][-1] if ticks[index_name] else price
+            ticks[index_name].append(price)
+            
+            if len(ticks[index_name]) < 2:
+                return
 
-        tick = data['tick']
-        symbol = tick['symbol']
-        price = float(tick['quote'])
-
-        # Ямар индекс вэ гэдгийг ол
-        index_name = None
-        for name, sym in INDICES.items():
-            if sym == symbol:
-                index_name = name
-                break
-
-        if not index_name:
-            return
-
-        ticks[index_name].append(price)
-
-        # ===== REDLINE + 1 MIN SPIKE ШАЛГАХ =====
-        if len(ticks[index_name]) >= 60:
-            old_price = ticks[index_name][0]
             new_price = ticks[index_name][-1]
-            change_pct = abs(new_price - old_price) / old_price * 100 if old_price!= 0 else 0
+            change_pct = abs((new_price - old_price) / old_price * 100 if old_price != 0 else 0)
 
-            # Хэрэв 1 минутын дотор их өөрчлөлт байвал - SPIKE!
-            if change_pct > 0.3: # Таны анхны дүрэм
-                msg = f"🚨 *SPIKE ALERT* 🚨\n\n📊 Index: {index_name}\n💰 Price: {price}\n📈 1Min Change: {change_pct:.4f}%\n⏰ Time: {time.strftime('%H:%M:%S')}\n\n🔴 Redline Break!"
+            # ТАНЫ АНХНЫ ДҮРЭМ - 0.3% SPIKE
+            if change_pct > 0.3:
+                msg = f"🚨 *SPIKE ALERT* 🚨\n\n📊 Index: {index_name}\n💰 Price: {price}\n📈 Change: {change_pct:.3f}%"
+                print(msg)
                 send_telegram(msg)
-                ticks[index_name].clear() # Дахин давтагдахаас сэргийлнэ
-
+                ticks[index_name].clear()
     except Exception as e:
         print(f"Message Error: {e}")
 
@@ -99,16 +79,24 @@ def on_close(ws, close_status_code, close_msg):
     print(f"Closed: {close_status_code} - {close_msg}")
     time.sleep(5)
 
-# ===== MAIN LOOP =====
-if __name__ == "__main__":
+def run_bot_forever():
+    print("🤖 7 Indices Bot Thread Starting...")
     while True:
         try:
             ws = websocket.WebSocketApp("wss://ws.binaryws.com/websockets/v3?app_id=1089",
-                                      on_message=on_message,
-                                      on_open=on_open,
-                                      on_error=on_error,
-                                      on_close=on_close)
+                on_message=on_message,
+                on_open=on_open,
+                on_error=on_error,
+                on_close=on_close)
             ws.run_forever(ping_interval=30, ping_timeout=10)
         except Exception as e:
             print(f"Main Loop Error: {e}")
             time.sleep(10)
+
+# ===== ЗӨВХӨН ЭНЭ 2 МӨР Л ЗАСВАР - БУСАД БҮГД ХЭВЭЭРЭЭ =====
+threading.Thread(target=run_bot_forever, daemon=True).start()
+print("✅ Bot Thread Started - Fixed!")
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
