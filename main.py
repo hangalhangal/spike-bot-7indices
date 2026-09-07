@@ -11,8 +11,10 @@ import websockets
 
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise ValueError("TELEGRAM_TOKEN not found!")
 
-# RENDER PORT FIX
+# ===== RENDER WEB SERVICE PORT FIX =====
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -22,11 +24,14 @@ class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
-    def log_message(self, *args): return
+    def log_message(self, *args):
+        return
 
 def run_keep_alive():
     port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), KeepAliveHandler).serve_forever()
+    httpd = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
+    logging.info(f"Keep-alive on {port}")
+    httpd.serve_forever()
 
 threading.Thread(target=run_keep_alive, daemon=True).start()
 
@@ -67,25 +72,45 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🧠 PREDICTIVE MANIAC - AI МАНГАС 🧠\n\n"
         "✅ AI өөрөө хөгжиж, суралцаж байна!\n"
-        "✅ ЗӨВХӨН 7 ИНДЕКС ДЭЭР АЖИЛЛАНА!\n"
-        "🧠 AI САНАМЖ: 500 Ticks\n\n"
-        "BOOM: 1000,500,600,900\nCRASH:1000,500,900\n\n"
-        "/test - Тест", reply_markup=reply_markup)
+        "✅ ЗӨВХӨН 7 ИНДЕКС ДЭЭР АЖИЛЛАНА!\n\n"
+        "BOOM: 1000, 500, 600, 900\n"
+        "CRASH: 1000, 500, 900\n\n"
+        "🧠 AI МАНГАС САНАМЖ: 500 Ticks санах ойтой!\n"
+        "Доороос 7-өөсөө сонгоод идэвхжүүл!\n"
+        "/test - Тест дохио",
+        reply_markup=reply_markup
+    )
 
 async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚠️ PREDICTIVE MANIAC\nBOOM1000\nTicks:455\nPrice:1234.56\nDrift 0.3% ✅\nTEST SIGNAL ✅")
+    await update.message.reply_text(
+        "⚠️ PREDICTIVE MANIAC\n"
+        "BOOM1000\n"
+        "Ticks:455\n"
+        "Price:1234.56\n"
+        "Drift 0.3% ✅\n"
+        "TEST SIGNAL - Bot ажиллаж байна! ✅\n\n"
+        "AI Мангас бэлэн! 7 индекс дээр ажиллаж байна!"
+    )
 
 async def handle_index(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     msg = update.message.text.strip()
-    if msg not in INDICES: return
-    if chat_id not in active_subscriptions: active_subscriptions[chat_id] = set()
+    if msg not in INDICES:
+        return
+    if chat_id not in active_subscriptions:
+        active_subscriptions[chat_id] = set()
     if msg in active_subscriptions[chat_id]:
         active_subscriptions[chat_id].remove(msg)
         await update.message.reply_text(f"❌ {msg} унтраалаа", reply_markup=reply_markup)
     else:
         active_subscriptions[chat_id].add(msg)
-        await update.message.reply_text(f"✅ {msg} идэвхжлээ!\n🧠 AI мангас сурч эхэллээ... Drift 0.3% хүрмэгц дохио ирнэ!", reply_markup=reply_markup)
+        await update.message.reply_text(
+            f"✅ {msg} идэвхжлээ!\n"
+            f"🧠 AI мангас {msg} дээр сурч эхэллээ...\n"
+            f"Drift 0.3% хүрмэгц дохио ирнэ!\n"
+            f"Ticks цуглуулж байна... (AI санах ой 500)",
+            reply_markup=reply_markup
+        )
         asyncio.create_task(deriv_watcher(msg, context))
 
 async def deriv_watcher(index_name, context):
@@ -100,16 +125,28 @@ async def deriv_watcher(index_name, context):
                     price = data["tick"]["quote"]
                     price_history[index_name].append(price)
                     if len(price_history[index_name]) >= 100:
-                        old = price_history[index_name][0]
-                        drift = abs(price - old) / old * 100
+                        old_price = price_history[index_name][0]
+                        drift = abs(price - old_price) / old_price * 100
                         ticks = len(price_history[index_name])
                         if drift >= 0.3 and ticks >= 200:
-                            for cid, subs in active_subscriptions.items():
+                            for chat_id, subs in active_subscriptions.items():
                                 if index_name in subs:
-                                    await context.bot.send_message(chat_id=cid, text=f"⚠️ PREDICTIVE MANIAC\n{symbol}\nTicks:{ticks}\nPrice:{price}\nDrift {drift:.2f}% ✅\n🧠 AI МАНГАС ДОХИО!")
-                                    await asyncio.sleep(30)
+                                    try:
+                                        await context.bot.send_message(
+                                            chat_id=chat_id,
+                                            text=f"⚠️ PREDICTIVE MANIAC\n"
+                                                 f"{symbol}\n"
+                                                 f"Ticks:{ticks}\n"
+                                                 f"Price:{price}\n"
+                                                 f"Drift {drift:.2f}% ✅\n"
+                                                 f"🧠 AI МАНГАС ДОХИО - {index_name} SPIKE удахгүй!",
+                                            reply_markup=reply_markup
+                                        )
+                                        await asyncio.sleep(30)
+                                    except Exception as e:
+                                        logging.error(f"Send error: {e}")
     except Exception as e:
-        logging.error(e)
+        logging.error(f"Deriv watcher error {index_name}: {e}")
         await asyncio.sleep(5)
         asyncio.create_task(deriv_watcher(index_name, context))
 
@@ -120,4 +157,4 @@ app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_index))
 
 if __name__ == "__main__":
     print("🧠 AI MANIAC - ONLY 7 INDICES + AI SELF LEARNING - STARTED...")
-    app.run_polling()
+    app.run_polling(close_loop=False, stop_signals=None)
