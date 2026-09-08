@@ -24,6 +24,7 @@ INDICES = {
 
 active = set()
 ticks_data = {k: [] for k in INDICES}
+drift_data = {k: 0.0 for k in INDICES}
 chat_ids = set()
 
 # Keep Alive - Render Port
@@ -59,10 +60,10 @@ async def deriv_ws(symbol, key, app):
                 if len(ticks_data[key]) >= 200:
                     old = ticks_data[key][-200]
                     drift = ((price - old) / old * 100) if old!= 0 else 0
+                    drift_data[key] = drift
 
                     if abs(drift) >= 0.3:
                         info = INDICES[key]
-                        # BUY / SELL тодорхой болголоо
                         if info["type"] == "BOOM":
                             action = "BUY NOW 🟢\nДээшээ ХАДАХ гэж байна! 📈"
                         else:
@@ -81,7 +82,6 @@ async def deriv_ws(symbol, key, app):
                                 await app.bot.send_message(chat_id=cid, text=text)
                             except:
                                 pass
-                        # Давхардлаас зайлсхийх
                         await asyncio.sleep(60)
 
 async def start_ws(symbol, key, app):
@@ -126,7 +126,19 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_ids.add(update.effective_chat.id)
+    msg = "📊 BOT STATUS - LIVE\n\n"
+    for k, v in INDICES.items():
+        t = len(ticks_data.get(k, []))
+        d = drift_data.get(k, 0.0)
+        mark = "✅" if k in active else "❌"
+        msg += f"{mark} {v['name']}: {t}/500 | Drift {d:.3f}%\n"
+    msg += f"\n🟢 Active: {len(active)}/7\n🧠 AI MANIAC ажиллаж байна!"
+    await update.message.reply_text(msg)
+
 async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_ids.add(update.effective_chat.id)
     await update.message.reply_text(
         "⚠️ PREDICTIVE MANIAC\n"
         "BOOM1000 - BUY NOW 🟢\n"
@@ -138,6 +150,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("test", test_cmd))
+app.add_handler(CommandHandler("status", status_cmd))
 app.add_handler(CallbackQueryHandler(button))
 
 if __name__ == "__main__":
