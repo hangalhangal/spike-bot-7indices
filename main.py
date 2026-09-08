@@ -45,11 +45,18 @@ threading.Thread(target=keep_alive, daemon=True).start()
 async def deriv_ws(symbol, key, app):
     uri = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
     async with websockets.connect(uri) as ws:
-        await ws.send(json.dumps({"ticks": symbol}))
+        await ws.send(json.dumps({"ticks_history": symbol, "count": 500, "end": "latest", "style": "ticks"}))
+        await ws.send(json.dumps({"ticks": symbol, "subscribe": 1}))
         while True:
             if key not in active:
                 return
             msg = json.loads(await ws.recv())
+            if "history" in msg:
+                try:
+                    prices = msg["history"]["prices"]
+                    ticks_data[key] = [float(p) for p in prices]
+                except:
+                    pass
             if "tick" in msg:
                 price = float(msg["tick"]["quote"])
                 ticks_data[key].append(price)
@@ -64,6 +71,7 @@ async def deriv_ws(symbol, key, app):
 
                     if abs(drift) >= 0.3:
                         info = INDICES[key]
+                        # BUY / SELL тодорхой болголоо
                         if info["type"] == "BOOM":
                             action = "BUY NOW 🟢\nДээшээ ХАДАХ гэж байна! 📈"
                         else:
@@ -82,6 +90,7 @@ async def deriv_ws(symbol, key, app):
                                 await app.bot.send_message(chat_id=cid, text=text)
                             except:
                                 pass
+                        # Давхардлаас зайлсхийх
                         await asyncio.sleep(60)
 
 async def start_ws(symbol, key, app):
@@ -126,6 +135,16 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
+async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_ids.add(update.effective_chat.id)
+    await update.message.reply_text(
+        "⚠️ PREDICTIVE MANIAC\n"
+        "BOOM1000 - BUY NOW 🟢\n"
+        "Ticks:455\n"
+        "Drift 0.3% ✅\n"
+        "AI МАНГАС TEST OK!"
+    )
+
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_ids.add(update.effective_chat.id)
     msg = "📊 BOT STATUS - LIVE\n\n"
@@ -136,16 +155,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{mark} {v['name']}: {t}/500 | Drift {d:.3f}%\n"
     msg += f"\n🟢 Active: {len(active)}/7\n🧠 AI MANIAC ажиллаж байна!"
     await update.message.reply_text(msg)
-
-async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_ids.add(update.effective_chat.id)
-    await update.message.reply_text(
-        "⚠️ PREDICTIVE MANIAC\n"
-        "BOOM1000 - BUY NOW 🟢\n"
-        "Ticks:455\n"
-        "Drift 0.3% ✅\n"
-        "AI МАНГАС TEST OK!"
-    )
 
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
