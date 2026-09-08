@@ -25,6 +25,8 @@ INDICES = {
 active = set()
 ticks_data = {k: [] for k in INDICES}
 drift_data = {k: 0.0 for k in INDICES}
+drift_threshold = {k: 0.3 for k in INDICES}
+learn_stats = {k: {"ok":0, "fail":0} for k in INDICES}
 chat_ids = set()
 
 # Keep Alive - Render Port
@@ -45,53 +47,66 @@ threading.Thread(target=keep_alive, daemon=True).start()
 async def deriv_ws(symbol, key, app):
     uri = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
     async with websockets.connect(uri) as ws:
-        await ws.send(json.dumps({"ticks_history": symbol, "count": 500, "end": "latest", "style": "ticks"}))
-        await ws.send(json.dumps({"ticks": symbol, "subscribe": 1}))
+        # ЗАСВАР: Таны хүссэн - 7 индексийн түүхийг автоматаар харах + Drift 0.000% засах
+        await ws.send(json.dumps({"ticks_history": symbol, "count": 500, "end": "latest", "style": "ticks", "subscribe": 1}))
         while True:
             if key not in active:
                 return
             msg = json.loads(await ws.recv())
+            price = None
             if "history" in msg:
                 try:
-                    prices = msg["history"]["prices"]
-                    ticks_data[key] = [float(p) for p in prices]
-                except:
-                    pass
+                    ticks_data[key] = [float(p) for p in msg["history"]["prices"]]
+                    price = ticks_data[key][-1]
+                except: pass
             if "tick" in msg:
                 price = float(msg["tick"]["quote"])
                 ticks_data[key].append(price)
                 if len(ticks_data[key]) > 500:
                     ticks_data[key].pop(0)
 
-                # AI МАНГАС 500 ticks + Drift 0.3%
-                if len(ticks_data[key]) >= 200:
-                    old = ticks_data[key][-200]
-                    drift = ((price - old) / old * 100) if old!= 0 else 0
-                    drift_data[key] = drift
+            if price is not None and len(ticks_data[key]) >= 200:
+                old = ticks_data[key][-200]
+                drift = ((price - old) / old * 100) if old!= 0 else 0
+                drift_data[key] = drift
 
-                    if abs(drift) >= 0.3:
-                        info = INDICES[key]
-                        # BUY / SELL тодорхой болголоо
-                        if info["type"] == "BOOM":
-                            action = "BUY NOW 🟢\nДээшээ ХАДАХ гэж байна! 📈"
+                if abs(drift) >= drift_threshold[key]:
+                    info = INDICES[key]
+                    if info["type"] == "BOOM":
+                        action = "BUY NOW 🟢\nДээшээ ХАДАХ гэж байна! 📈"
+                    else:
+                        action = "SELL NOW 🔴\nДоошоо УНАХ гэж байна! 📉"
+
+                    text = (
+                        f"⚠️ PREDICTIVE MANIAC\n"
+                        f"{info['symbol']} - {action}\n\n"
+                        f"Ticks: {len(ticks_data[key])}\n"
+                        f"Price: {price}\n"
+                        f"Drift {drift:.2f}% Bosgo {drift_threshold[key]:.2f}% ✅\n"
+                        f"🧠 AI МАНГАС! OK:{learn_stats[key]['ok']} FAIL:{learn_stats[key]['fail']}"
+                    )
+                    for cid in list(chat_ids):
+                        try:
+                            await app.bot.send_message(chat_id=cid, text=text)
+                        except:
+                            pass
+
+                    # Өөрөө суралцах - Спайк дээр алдаа гарвал
+                    pred = price
+                    await asyncio.sleep(30)
+                    if len(ticks_data[key])>5:
+                        after = ticks_data[key][-1]
+                        if abs((after-pred)/pred*100) < 0.1:
+                            learn_stats[key]["fail"]+=1
+                            drift_threshold[key] = min(0.8, drift_threshold[key]+0.05)
                         else:
-                            action = "SELL NOW 🔴\nДоошоо УНАХ гэж байна! 📉"
+                            learn_stats[key]["ok"]+=1
+                            drift_threshold[key] = max(0.25, drift_threshold[key]-0.01)
+                    else:
+                        await asyncio.sleep(30)
 
-                        text = (
-                            f"⚠️ PREDICTIVE MANIAC\n"
-                            f"{info['symbol']} - {action}\n\n"
-                            f"Ticks: {len(ticks_data[key])}\n"
-                            f"Price: {price}\n"
-                            f"Drift {drift:.2f}% ✅\n"
-                            f"🧠 AI МАНГАС!"
-                        )
-                        for cid in list(chat_ids):
-                            try:
-                                await app.bot.send_message(chat_id=cid, text=text)
-                            except:
-                                pass
-                        # Давхардлаас зайлсхийх
-                        await asyncio.sleep(60)
+                # Давхардлаас зайлсхийх
+                # await asyncio.sleep(60) - суралцах дотор байгаа
 
 async def start_ws(symbol, key, app):
     while key in active:
@@ -147,13 +162,10 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_ids.add(update.effective_chat.id)
-    msg = "📊 BOT STATUS - LIVE\n\n"
-    for k, v in INDICES.items():
-        t = len(ticks_data.get(k, []))
-        d = drift_data.get(k, 0.0)
-        mark = "✅" if k in active else "❌"
-        msg += f"{mark} {v['name']}: {t}/500 | Drift {d:.3f}%\n"
-    msg += f"\n🟢 Active: {len(active)}/7\n🧠 AI MANIAC ажиллаж байна!"
+    msg="📊 BOT STATUS - LIVE\n\n"
+    for k,v in INDICES.items():
+        msg+=f"{'✅' if k in active else '❌'} {v['name']}: {len(ticks_data.get(k,[]))}/500 | Drift {drift_data.get(k,0.0):.3f}% | Bosgo {drift_threshold[k]:.2f}%\n"
+    msg+=f"\n🟢 Active: {len(active)}/7\n🧠 AI MANIAC ажиллаж байна!"
     await update.message.reply_text(msg)
 
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
