@@ -754,6 +754,7 @@ def features(prices):
             )
 
     dist=since/300
+
     freq=min(
         large/10,
         1
@@ -992,6 +993,7 @@ def warmup(k):
                 break
 
     for y,f in pairs:
+
         train_model(
             k,
             f,
@@ -1214,13 +1216,6 @@ def _symbol_matches(
     item
 ):
 
-    """
-    Deriv API-ийн old/new response field-үүдийг хоёуланг нь дэмжинэ.
-
-    Хэзээ ч BOOM1000 гэх мэт symbol-ийг хүчээр зохиохгүй.
-    active_symbols-оос ирсэн бодит symbol-ийг л ашиглана.
-    """
-
     symbol=(
         item.get("underlying_symbol")
         or item.get("symbol")
@@ -1243,17 +1238,11 @@ def _symbol_matches(
         symbol
     ).replace(" ","")
 
-    # --------------------------------------------------------
-    # 1. Exact display name
-    # --------------------------------------------------------
-
+    # 1. Exact name
     if n==target:
         return True
 
-    # --------------------------------------------------------
     # 2. BOOM/CRASH + number + INDEX
-    # --------------------------------------------------------
-
     family=info["type"]
 
     number=(
@@ -1269,10 +1258,7 @@ def _symbol_matches(
     ):
         return True
 
-    # --------------------------------------------------------
-    # 3. Symbol fallback
-    # --------------------------------------------------------
-
+    # 3. Symbol match
     if (
         family in sym
         and number in sym
@@ -1285,20 +1271,23 @@ def _symbol_matches(
 async def get_active_symbols(ws):
 
     """
-    Deriv-ийн active_symbols public endpoint ашиглана.
+    Current Deriv API-compatible active_symbols request.
 
-    Old API:
-        symbol
-        display_name
+    IMPORTANT:
+    product_type is intentionally NOT sent because
+    current New API removed it.
 
-    New API:
+    Supports:
         underlying_symbol
         underlying_symbol_name
+
+    and legacy:
+        symbol
+        display_name
     """
 
     request={
         "active_symbols":"brief",
-        "product_type":"basic",
         "req_id":9001
     }
 
@@ -1351,6 +1340,10 @@ async def get_active_symbols(ws):
 
         found={}
 
+        # ----------------------------------------------------
+        # First try real symbols returned by Deriv
+        # ----------------------------------------------------
+
         for item in items:
 
             symbol=(
@@ -1376,10 +1369,44 @@ async def get_active_symbols(ws):
                         symbol
                     )
 
+        # ----------------------------------------------------
+        # Stable known Deriv symbols.
+        #
+        # These are used only if active_symbols does not
+        # expose the corresponding Boom/Crash entry.
+        # ----------------------------------------------------
+
+        stable={
+            "BOOM1000":"BOOM1000",
+            "BOOM500":"BOOM500",
+            "BOOM600":"BOOM600",
+            "BOOM900":"BOOM900",
+            "CRASH1000":"CRASH1000",
+            "CRASH500":"CRASH500",
+            "CRASH900":"CRASH900"
+        }
+
+        for key,symbol in stable.items():
+
+            if key not in found:
+
+                found[key]=symbol
+
+                logging.warning(
+                    "%s not listed by active_symbols; "
+                    "using stable symbol %s",
+                    key,
+                    symbol
+                )
+
+        # ----------------------------------------------------
+        # Final validation
+        # ----------------------------------------------------
+
         missing=[
             k
             for k in INDICES
-            if k not in found
+            if not found.get(k)
         ]
 
         if missing:
@@ -1477,7 +1504,7 @@ async def deriv_ws(k,app):
             )
 
             # ------------------------------------------------
-            # Resolve all symbols from Deriv
+            # Resolve symbols
             # ------------------------------------------------
 
             symbols=await get_active_symbols(
@@ -1498,7 +1525,7 @@ async def deriv_ws(k,app):
             # HISTORY
             #
             # IMPORTANT:
-            # Do NOT send subscribe: 0 here.
+            # No subscribe:0 here.
             # ------------------------------------------------
 
             await ws.send(
@@ -1616,7 +1643,7 @@ async def deriv_ws(k,app):
                     diag[k]["last_msg_type"]="HISTORY"
 
                     # Latest 500 historical ticks
-                    # become the live feature buffer.
+                    # become live feature buffer.
 
                     ticks_data[k].clear()
 
@@ -1628,8 +1655,7 @@ async def deriv_ws(k,app):
                             item
                         )
 
-                    # Train in a worker thread
-                    # so Telegram loop is not blocked.
+                    # Train without blocking Telegram.
 
                     await asyncio.to_thread(
                         warmup,
@@ -1671,10 +1697,14 @@ async def deriv_ws(k,app):
                     except Exception as e:
 
                         diag[k]["errors"]+=1
+
                         diag[k]["last_error"]=(
                             f"tick parse: {e}"
                         )
-                        diag[k]["last_msg_type"]="TICK_PARSE_ERROR"
+
+                        diag[k]["last_msg_type"]=(
+                            "TICK_PARSE_ERROR"
+                        )
 
                         continue
 
