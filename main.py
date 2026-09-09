@@ -3,6 +3,7 @@ import json
 import asyncio
 import logging
 import threading
+import math
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import deque
 
@@ -17,11 +18,6 @@ from telegram.ext import (
 
 logging.basicConfig(level=logging.INFO)
 
-
-# ============================================================
-# TOKEN
-# ============================================================
-
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 if not TOKEN:
@@ -30,8 +26,8 @@ if not TOKEN:
 
 # ============================================================
 # AI МАНГАС V5 FIX
-# DERIV NEW PUBLIC API
-# 7 BOOM / CRASH INDEX
+# STEP 3 — FEATURE ENGINE
+# EXACT 7 BOOM / CRASH INDEX
 # ============================================================
 
 DERIV_PUBLIC_WS = (
@@ -56,6 +52,16 @@ INDICES = {
 
 
 # ============================================================
+# SETTINGS
+# ============================================================
+
+HISTORY_COUNT = 5000
+TRAINING_COUNT = 300
+
+TICK_BUFFER = 5000
+
+
+# ============================================================
 # DATA
 # ============================================================
 
@@ -64,7 +70,7 @@ active = set()
 tasks = {}
 
 ticks = {
-    symbol: deque(maxlen=500)
+    symbol: deque(maxlen=TICK_BUFFER)
     for symbol in INDICES
 }
 
@@ -81,7 +87,28 @@ diag = {
         "ticks": 0,
         "history": 0,
         "training": 0,
+        "features": 0,
         "error": "",
+    }
+    for symbol in INDICES
+}
+
+
+# ============================================================
+# FEATURE DATA
+# ============================================================
+
+features = {
+    symbol: {
+        "price": 0.0,
+        "ema20": 0.0,
+        "ema50": 0.0,
+        "rsi14": 0.0,
+        "atr14": 0.0,
+        "momentum10": 0.0,
+        "volatility20": 0.0,
+        "trend": "NEUTRAL",
+        "direction": "NONE",
     }
     for symbol in INDICES
 }
@@ -108,7 +135,7 @@ def keep_alive():
             self.end_headers()
 
             self.wfile.write(
-                b"AI MANGAS V5 FIX - 7 INDEX LIVE"
+                b"AI MANGAS V5 FIX - FEATURE ENGINE"
             )
 
         def log_message(self, *args):
@@ -127,7 +154,7 @@ threading.Thread(
 
 
 # ============================================================
-# RESET STATUS
+# RESET
 # ============================================================
 
 def reset_diag(symbol):
@@ -139,61 +166,409 @@ def reset_diag(symbol):
         "ticks": 0,
         "history": 0,
         "training": 0,
+        "features": 0,
         "error": "",
+    }
+
+    features[symbol] = {
+        "price": 0.0,
+        "ema20": 0.0,
+        "ema50": 0.0,
+        "rsi14": 0.0,
+        "atr14": 0.0,
+        "momentum10": 0.0,
+        "volatility20": 0.0,
+        "trend": "NEUTRAL",
+        "direction": "NONE",
     }
 
     ticks[symbol].clear()
 
 
 # ============================================================
-# PROCESS HISTORY
+# EMA
 # ============================================================
 
-def process_history(symbol, prices):
+def calculate_ema(prices, period):
 
-    if not isinstance(prices, list):
+    if len(prices) < period:
+        return None
+
+    values = prices[-period:]
+
+    ema = sum(values) / period
+
+    multiplier = 2.0 / (period + 1.0)
+
+    for price in values[1:]:
+
+        ema = (
+            (price - ema) * multiplier
+            + ema
+        )
+
+    return ema
+
+
+# ============================================================
+# RSI
+# ============================================================
+
+def calculate_rsi(prices, period=14):
+
+    if len(prices) < period + 1:
+        return None
+
+    recent = prices[-(period + 1):]
+
+    gains = 0.0
+    losses = 0.0
+
+    for i in range(1, len(recent)):
+
+        change = (
+            recent[i]
+            - recent[i - 1]
+        )
+
+        if change > 0:
+            gains += change
+
+        elif change < 0:
+            losses += abs(change)
+
+    average_gain = gains / period
+    average_loss = losses / period
+
+    if average_loss == 0:
+
+        if average_gain == 0:
+            return 50.0
+
+        return 100.0
+
+    rs = (
+        average_gain
+        / average_loss
+    )
+
+    return 100.0 - (
+        100.0 / (1.0 + rs)
+    )
+
+
+# ============================================================
+# ATR
+# ============================================================
+
+def calculate_atr(prices, period=14):
+
+    if len(prices) < period + 1:
+        return None
+
+    recent = prices[-(period + 1):]
+
+    true_ranges = []
+
+    for i in range(1, len(recent)):
+
+        current = recent[i]
+        previous = recent[i - 1]
+
+        true_range = abs(
+            current - previous
+        )
+
+        true_ranges.append(
+            true_range
+        )
+
+    if not true_ranges:
+        return None
+
+    return (
+        sum(
+            true_ranges[-period:]
+        )
+        / min(
+            period,
+            len(true_ranges)
+        )
+    )
+
+
+# ============================================================
+# MOMENTUM
+# ============================================================
+
+def calculate_momentum(prices, period=10):
+
+    if len(prices) <= period:
+        return None
+
+    old_price = prices[-period - 1]
+    current_price = prices[-1]
+
+    if old_price == 0:
+        return 0.0
+
+    return (
+        (
+            current_price
+            - old_price
+        )
+        / old_price
+    ) * 100.0
+
+
+# ============================================================
+# VOLATILITY
+# ============================================================
+
+def calculate_volatility(prices, period=20):
+
+    if len(prices) < period + 1:
+        return None
+
+    changes = []
+
+    recent = prices[-(period + 1):]
+
+    for i in range(1, len(recent)):
+
+        previous = recent[i - 1]
+
+        current = recent[i]
+
+        if previous == 0:
+            continue
+
+        change = (
+            current - previous
+        ) / previous
+
+        changes.append(change)
+
+    if len(changes) < 2:
+        return 0.0
+
+    mean = (
+        sum(changes)
+        / len(changes)
+    )
+
+    variance = (
+        sum(
+            (x - mean) ** 2
+            for x in changes
+        )
+        / len(changes)
+    )
+
+    return (
+        math.sqrt(variance)
+        * 100.0
+    )
+
+
+# ============================================================
+# FEATURE ENGINE
+# ============================================================
+
+def calculate_features(symbol):
+
+    if len(ticks[symbol]) < 50:
+
+        diag[symbol]["features"] = 0
+
+        return False
+
+    prices = [
+        float(item[1])
+        for item in ticks[symbol]
+    ]
+
+    if len(prices) < 50:
+
+        return False
+
+    price = prices[-1]
+
+    ema20 = calculate_ema(
+        prices,
+        20
+    )
+
+    ema50 = calculate_ema(
+        prices,
+        50
+    )
+
+    rsi14 = calculate_rsi(
+        prices,
+        14
+    )
+
+    atr14 = calculate_atr(
+        prices,
+        14
+    )
+
+    momentum10 = calculate_momentum(
+        prices,
+        10
+    )
+
+    volatility20 = calculate_volatility(
+        prices,
+        20
+    )
+
+    if (
+        ema20 is None
+        or ema50 is None
+        or rsi14 is None
+        or atr14 is None
+        or momentum10 is None
+        or volatility20 is None
+    ):
+
+        return False
+
+
+    # ========================================================
+    # TREND CLASSIFICATION
+    # ========================================================
+
+    if ema20 > ema50:
+
+        trend = "BULLISH"
+
+    elif ema20 < ema50:
+
+        trend = "BEARISH"
+
+    else:
+
+        trend = "NEUTRAL"
+
+
+    # ========================================================
+    # MOMENTUM DIRECTION
+    # ========================================================
+
+    if momentum10 > 0:
+
+        direction = "UP"
+
+    elif momentum10 < 0:
+
+        direction = "DOWN"
+
+    else:
+
+        direction = "FLAT"
+
+
+    # ========================================================
+    # SAVE FEATURES
+    # ========================================================
+
+    features[symbol] = {
+        "price": price,
+        "ema20": ema20,
+        "ema50": ema50,
+        "rsi14": rsi14,
+        "atr14": atr14,
+        "momentum10": momentum10,
+        "volatility20": volatility20,
+        "trend": trend,
+        "direction": direction,
+    }
+
+    diag[symbol]["features"] = 1
+
+    return True
+
+
+# ============================================================
+# HISTORY PROCESS
+# ============================================================
+
+def process_history(symbol, prices, times=None):
+
+    if not isinstance(
+        prices,
+        list
+    ):
+
         raise RuntimeError(
             "History prices is not a list"
         )
 
     if len(prices) == 0:
+
         raise RuntimeError(
             "History returned 0 prices"
         )
 
     diag[symbol]["history"] = len(prices)
 
-    # Keep latest 500 prices for live processing
     ticks[symbol].clear()
 
-    latest_prices = prices[-500:]
+    if isinstance(times, list):
 
-    for price in latest_prices:
+        pairs = list(
+            zip(
+                times,
+                prices
+            )
+        )
+
+    else:
+
+        pairs = [
+            (0.0, price)
+            for price in prices
+        ]
+
+    for epoch, price in pairs:
 
         try:
 
             ticks[symbol].append(
                 (
-                    0.0,
+                    float(epoch),
                     float(price)
                 )
             )
 
         except Exception:
+
             continue
 
-    # --------------------------------------------------------
-    # Training sample count
-    # --------------------------------------------------------
+
+    # ========================================================
+    # TRAINING SAMPLE COUNT
+    # ========================================================
 
     diag[symbol]["training"] = min(
         len(prices),
-        300
+        TRAINING_COUNT
+    )
+
+
+    # ========================================================
+    # INITIAL FEATURES
+    # ========================================================
+
+    calculate_features(
+        symbol
     )
 
 
 # ============================================================
-# DERIV CONNECTION
+# DERIV WORKER
 # ============================================================
 
 async def deriv_worker(symbol):
@@ -205,14 +580,11 @@ async def deriv_worker(symbol):
         try:
 
             # =================================================
-            # HISTORY CONNECTION
+            # HISTORY
             # =================================================
 
-            diag[symbol]["stage"] = "CONNECTING HISTORY"
-
-            logging.info(
-                "[%s] Connecting for history...",
-                symbol
+            diag[symbol]["stage"] = (
+                "CONNECTING HISTORY"
             )
 
             async with websockets.connect(
@@ -224,26 +596,21 @@ async def deriv_worker(symbol):
 
                 diag[symbol]["connected"] = 1
 
-                diag[symbol]["stage"] = "HISTORY"
+                diag[symbol]["stage"] = (
+                    "HISTORY"
+                )
 
-                history_request = {
+                request = {
                     "ticks_history": symbol,
-                    "count": 5000,
+                    "count": HISTORY_COUNT,
                     "end": "latest",
                     "style": "ticks",
                     "req_id": 2000
                 }
 
-                logging.info(
-                    "[%s] Requesting 5000 history...",
-                    symbol
-                )
-
                 await ws.send(
-                    json.dumps(history_request)
+                    json.dumps(request)
                 )
-
-                history_received = False
 
                 while True:
 
@@ -256,15 +623,11 @@ async def deriv_worker(symbol):
 
                     if "error" in msg:
 
-                        error_message = (
+                        raise RuntimeError(
                             msg["error"].get(
                                 "message",
                                 "Deriv API error"
                             )
-                        )
-
-                        raise RuntimeError(
-                            error_message
                         )
 
                     history = msg.get(
@@ -281,38 +644,26 @@ async def deriv_worker(symbol):
                             []
                         )
 
-                        process_history(
-                            symbol,
-                            prices
+                        times = history.get(
+                            "times",
+                            []
                         )
 
-                        history_received = True
-
-                        logging.info(
-                            "[%s] History received: %s",
+                        process_history(
                             symbol,
-                            len(prices)
+                            prices,
+                            times
                         )
 
                         break
 
-                if not history_received:
-
-                    raise RuntimeError(
-                        "History response not received"
-                    )
 
             # =================================================
-            # LIVE CONNECTION
+            # LIVE
             # =================================================
 
             diag[symbol]["stage"] = (
                 "CONNECTING LIVE"
-            )
-
-            logging.info(
-                "[%s] Connecting for live ticks...",
-                symbol
             )
 
             async with websockets.connect(
@@ -326,19 +677,14 @@ async def deriv_worker(symbol):
 
                 diag[symbol]["stage"] = "LIVE"
 
-                live_request = {
+                request = {
                     "ticks": symbol,
                     "subscribe": 1,
                     "req_id": 3000
                 }
 
-                logging.info(
-                    "[%s] Subscribing live ticks...",
-                    symbol
-                )
-
                 await ws.send(
-                    json.dumps(live_request)
+                    json.dumps(request)
                 )
 
                 while symbol in active:
@@ -352,84 +698,66 @@ async def deriv_worker(symbol):
 
                     if "error" in msg:
 
-                        error_message = (
+                        raise RuntimeError(
                             msg["error"].get(
                                 "message",
                                 "Deriv API error"
                             )
                         )
 
-                        raise RuntimeError(
-                            error_message
-                        )
-
-                    # ------------------------------------------------
-                    # LIVE TICK
-                    # ------------------------------------------------
-
                     tick = msg.get(
                         "tick"
                     )
 
-                    if isinstance(
+                    if not isinstance(
                         tick,
                         dict
                     ):
 
-                        quote = tick.get(
-                            "quote"
+                        continue
+
+                    quote = tick.get(
+                        "quote"
+                    )
+
+                    epoch = tick.get(
+                        "epoch",
+                        0
+                    )
+
+                    if quote is None:
+                        continue
+
+                    price = float(
+                        quote
+                    )
+
+                    ticks[symbol].append(
+                        (
+                            float(epoch),
+                            price
                         )
+                    )
 
-                        epoch = tick.get(
-                            "epoch",
-                            0
-                        )
+                    diag[symbol]["subscribed"] = 1
 
-                        if quote is not None:
+                    diag[symbol]["ticks"] += 1
 
-                            price = float(
-                                quote
-                            )
+                    # =================================================
+                    # FEATURE CALCULATION
+                    # =================================================
 
-                            ticks[symbol].append(
-                                (
-                                    float(epoch),
-                                    price
-                                )
-                            )
+                    calculate_features(
+                        symbol
+                    )
 
-                            diag[symbol][
-                                "subscribed"
-                            ] = 1
+                    diag[symbol]["stage"] = "LIVE"
 
-                            diag[symbol][
-                                "ticks"
-                            ] += 1
-
-                            diag[symbol][
-                                "stage"
-                            ] = "LIVE"
-
-                            logging.info(
-                                "[%s] LIVE tick: %s",
-                                symbol,
-                                price
-                            )
-
-            if symbol in active:
-
-                raise RuntimeError(
-                    "Live WebSocket closed"
-                )
 
         except asyncio.CancelledError:
 
-            logging.info(
-                "[%s] Worker cancelled",
-                symbol
-            )
-
             return
+
 
         except Exception as e:
 
@@ -445,7 +773,7 @@ async def deriv_worker(symbol):
             )
 
             logging.error(
-                "[%s] ERROR: %s",
+                "[%s] %s",
                 symbol,
                 diag[symbol]["error"]
             )
@@ -474,21 +802,6 @@ def start_index(symbol):
 
 
 # ============================================================
-# STOP INDEX
-# ============================================================
-
-def stop_index(symbol):
-
-    active.discard(symbol)
-
-    task = tasks.get(symbol)
-
-    if task and not task.done():
-
-        task.cancel()
-
-
-# ============================================================
 # START
 # ============================================================
 
@@ -503,10 +816,9 @@ async def start(
 
     await update.message.reply_text(
         "👹🧠 AI МАНГАС V5 FIX\n\n"
-        "7 INDEX CONNECTION STARTED ✅\n\n"
-        "5000 History → Training 300 → "
-        "Live Tick\n\n"
-        "/status — одоогийн төлөв"
+        "7 INDEX LIVE + FEATURE ENGINE ✅\n\n"
+        "History → Live Tick → Features\n\n"
+        "/status"
     )
 
 
@@ -522,14 +834,16 @@ async def status(
     lines = [
         "👹🧠 AI МАНГАС V5 FIX",
         "",
-        "📡 7 INDEX LIVE STATUS",
-        "====================",
+        "🧠 FEATURE ENGINE STATUS",
+        "========================",
         ""
     ]
 
     for symbol, name in INDICES.items():
 
         d = diag[symbol]
+
+        f = features[symbol]
 
         ws_status = (
             "ON ✅"
@@ -543,6 +857,12 @@ async def status(
             else "NO ❌"
         )
 
+        feature_status = (
+            "READY ✅"
+            if d["features"]
+            else "WAITING ⏳"
+        )
+
         lines.extend(
             [
                 f"{name}",
@@ -553,6 +873,28 @@ async def status(
                 f"Live ticks: {d['ticks']}",
                 f"History: {d['history']}",
                 f"Training: {d['training']}",
+                f"Features: {feature_status}",
+            ]
+        )
+
+        if d["features"]:
+
+            lines.extend(
+                [
+                    f"Price: {f['price']:.5f}",
+                    f"EMA20: {f['ema20']:.5f}",
+                    f"EMA50: {f['ema50']:.5f}",
+                    f"RSI14: {f['rsi14']:.2f}",
+                    f"ATR14: {f['atr14']:.5f}",
+                    f"Momentum10: {f['momentum10']:.4f}%",
+                    f"Volatility20: {f['volatility20']:.5f}%",
+                    f"Trend: {f['trend']}",
+                    f"Direction: {f['direction']}",
+                ]
+            )
+
+        lines.extend(
+            [
                 f"Err: {d['error'] or 'NONE'}",
                 "--------------------",
             ]
@@ -560,7 +902,6 @@ async def status(
 
     text = "\n".join(lines)
 
-    # Telegram message limit protection
     while len(text) > 3800:
 
         cut = text.rfind(
@@ -630,7 +971,7 @@ async def rawstatus(
         f"{DERIV_PUBLIC_WS}\n\n"
         f"Active workers: "
         f"{len(active)}/7\n\n"
-        "7 INDEX CONNECTION MODE"
+        "FEATURE ENGINE MODE"
     )
 
 
@@ -656,14 +997,12 @@ app = (
     .build()
 )
 
-
 app.add_handler(
     CommandHandler(
         "start",
         start
     )
 )
-
 
 app.add_handler(
     CommandHandler(
@@ -672,14 +1011,12 @@ app.add_handler(
     )
 )
 
-
 app.add_handler(
     CommandHandler(
         "symbols",
         symbols
     )
 )
-
 
 app.add_handler(
     CommandHandler(
