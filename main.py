@@ -261,7 +261,7 @@ async def get_active_symbols(ws):
     use the stable Deriv symbol identifier as a fallback and let the tick
     request itself report any real API-side invalid-symbol error.
     """
-    await ws.send(json.dumps({"active_symbols":"brief","req_id":9001}))
+    await ws.send(json.dumps({"active_symbols":"brief","product_type":"basic","req_id":9001}))
     while True:
         raw=await ws.recv()
         msg=json.loads(raw)
@@ -302,7 +302,7 @@ async def get_active_symbols(ws):
         return found
 
 async def deriv_ws(k,app):
-    uri="wss://ws.binaryws.com/websockets/v3?app_id={}".format(os.getenv("DERIV_APP_ID","1089"))
+    uri="wss://ws.binaryws.com/websockets/v3"
     diag[k]["last_error"]=""
     try:
         async with websockets.connect(uri,ping_interval=20,ping_timeout=20,close_timeout=10) as ws:
