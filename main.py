@@ -528,11 +528,38 @@ async def status(update,context):
 
 async def symbols(update,context):
     chat_ids.add(update.effective_chat.id)
-    lines=["🔎 DERIV SYMBOL MAP\n━━━━━━━━━━━━━━━━━━"]
-    for k,info in INDICES.items():
-        lines.append(f"{info['name']}: {DERIV_SYMBOLS.get(k) or 'NOT RESOLVED'}")
-    lines.append("━━━━━━━━━━━━━━━━━━\nℹ️ Symbols are resolved from active_symbols; stable fallback is used if a display-name match is unavailable.")
-    await update.message.reply_text("\n".join(lines))
+    lines=["🔎 DERIV LIVE SYMBOL CHECK\n━━━━━━━━━━━━━━━━━━"]
+    uri="wss://ws.binaryws.com/websockets/v3"
+    try:
+        async with websockets.connect(uri,ping_interval=20,ping_timeout=20,close_timeout=10) as ws:
+            await ws.send(json.dumps({"active_symbols":"brief","req_id":9100}))
+            while True:
+                raw=await ws.recv()
+                msg=json.loads(raw)
+                if msg.get("msg_type")=="error":
+                    err=msg.get("error",{})
+                    raise RuntimeError(err.get("message","active_symbols error"))
+                if msg.get("msg_type")!="active_symbols":
+                    continue
+                found={}
+                for item in msg.get("active_symbols",[]):
+                    symbol=item.get("underlying_symbol") or item.get("symbol")
+                    name=item.get("underlying_symbol_name") or item.get("display_name") or ""
+                    if not symbol:
+                        continue
+                    text=_norm_symbol_text(f"{symbol} {name}")
+                    if "BOOM" in text or "CRASH" in text:
+                        lines.append(f"{name or symbol}: {symbol}")
+                        found[str(symbol)]=str(name)
+                if len(lines)==1:
+                    lines.append("⚠️ BOOM/CRASH symbol олдсонгүй.")
+                lines.append("━━━━━━━━━━━━━━━━━━")
+                lines.append(f"📡 Active symbols received: {len(msg.get('active_symbols',[]))}")
+                await update.message.reply_text("\n".join(lines))
+                return
+    except Exception as e:
+        logging.exception("/symbols live check failed")
+        await update.message.reply_text("\n".join(lines+[f"❌ ERROR: {type(e).__name__}: {e}"]))
 
 async def ai(update,context):
     chat_ids.add(update.effective_chat.id);msg="🧠🔥 AI BRAIN\n━━━━━━━━━━━━━━━━━━\n"
