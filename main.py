@@ -27,7 +27,7 @@ if not TOKEN:
 # ============================================================
 # AI МАНГАС V5 FIX
 # STEP 4 — FEATURE + PRICE ACTION + MARKET STRUCTURE
-# RSI STABLE WILDER
+# MOVE STRENGTH FIX
 # EXACT 7 BOOM / CRASH INDEX
 # ============================================================
 
@@ -60,10 +60,11 @@ HISTORY_COUNT = 5000
 TRAINING_COUNT = 300
 TICK_BUFFER = 5000
 
-# Tick-based swing confirmation.
-# This is NOT candle structure.
 SWING_LEFT = 5
 SWING_RIGHT = 5
+
+# Move Strength uses only recent movement.
+MOVE_STRENGTH_LOOKBACK = 20
 
 
 # ============================================================
@@ -480,10 +481,6 @@ def calculate_market_structure(symbol):
     if len(prices) < minimum_needed:
         return False
 
-    # --------------------------------------------------------
-    # Find confirmed swing highs/lows
-    # --------------------------------------------------------
-
     swing_highs = []
     swing_lows = []
 
@@ -518,10 +515,6 @@ def calculate_market_structure(symbol):
                 (i, current)
             )
 
-    # --------------------------------------------------------
-    # Need at least two highs and two lows
-    # --------------------------------------------------------
-
     if (
         len(swing_highs) < 2
         or len(swing_lows) < 2
@@ -545,10 +538,6 @@ def calculate_market_structure(symbol):
     )
 
     current_price = prices[-1]
-
-    # --------------------------------------------------------
-    # Structure classification
-    # --------------------------------------------------------
 
     high_is_higher = (
         latest_high > previous_high
@@ -595,10 +584,6 @@ def calculate_market_structure(symbol):
         structure_name = "RANGE"
 
 
-    # --------------------------------------------------------
-    # Direction from structure
-    # --------------------------------------------------------
-
     bullish_structure = (
         high_is_higher
         and low_is_higher
@@ -610,12 +595,9 @@ def calculate_market_structure(symbol):
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # BOS
-    #
-    # Current price breaking the latest confirmed
-    # swing level.
-    # --------------------------------------------------------
+    # ========================================================
 
     bos = "NONE"
 
@@ -634,15 +616,9 @@ def calculate_market_structure(symbol):
         bos = "BEARISH"
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # CHoCH
-    #
-    # A structure-direction change:
-    # bullish structure + break below low
-    # bearish structure + break above high
-    #
-    # This is tick-based and intentionally conservative.
-    # --------------------------------------------------------
+    # ========================================================
 
     choch = "NONE"
 
@@ -657,31 +633,48 @@ def calculate_market_structure(symbol):
             choch = "BEARISH"
 
 
-    # --------------------------------------------------------
-    # Support / Resistance
-    # --------------------------------------------------------
+    # ========================================================
+    # SUPPORT / RESISTANCE
+    # ========================================================
 
     support = latest_low
     resistance = latest_high
 
 
-    # --------------------------------------------------------
-    # Movement strength
+    # ========================================================
+    # MOVE STRENGTH — FIX
     #
-    # Distance from recent structure normalized by ATR.
-    # --------------------------------------------------------
+    # Only measure the recent 20-tick movement.
+    # Do NOT use the distance to an old swing.
+    #
+    # Result:
+    # 1.0  = movement approximately equal to ATR
+    # 2.0  = approximately 2 ATR
+    # 0.5  = approximately half ATR
+    # ========================================================
 
     atr = features[symbol]["atr14"]
 
     if atr and atr > 0:
 
-        distance_to_structure = max(
-            abs(current_price - latest_high),
-            abs(current_price - latest_low)
+        lookback = min(
+            MOVE_STRENGTH_LOOKBACK,
+            len(prices) - 1
+        )
+
+        start_price = prices[
+            -lookback - 1
+        ]
+
+        recent_price = prices[-1]
+
+        recent_move = abs(
+            recent_price
+            - start_price
         )
 
         move_strength = (
-            distance_to_structure
+            recent_move
             / atr
         )
 
@@ -690,9 +683,9 @@ def calculate_market_structure(symbol):
         move_strength = 0.0
 
 
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
+    # ========================================================
+    # SAVE
+    # ========================================================
 
     structure[symbol] = {
         "swing_high": latest_high,
@@ -774,10 +767,6 @@ def calculate_features(symbol):
         return False
 
 
-    # ========================================================
-    # TREND CLASSIFICATION
-    # ========================================================
-
     if ema20 > ema50:
 
         trend = "BULLISH"
@@ -790,10 +779,6 @@ def calculate_features(symbol):
 
         trend = "NEUTRAL"
 
-
-    # ========================================================
-    # MOMENTUM DIRECTION
-    # ========================================================
 
     if momentum10 > 0:
 
@@ -808,10 +793,6 @@ def calculate_features(symbol):
         direction = "FLAT"
 
 
-    # ========================================================
-    # SAVE FEATURES
-    # ========================================================
-
     features[symbol] = {
         "price": price,
         "ema20": ema20,
@@ -825,11 +806,6 @@ def calculate_features(symbol):
     }
 
     diag[symbol]["features"] = 1
-
-
-    # ========================================================
-    # MARKET STRUCTURE
-    # ========================================================
 
     calculate_market_structure(
         symbol
@@ -895,19 +871,10 @@ def process_history(symbol, prices, times=None):
             continue
 
 
-    # ========================================================
-    # TRAINING SAMPLE COUNT
-    # ========================================================
-
     diag[symbol]["training"] = min(
         len(prices),
         TRAINING_COUNT
     )
-
-
-    # ========================================================
-    # INITIAL FEATURES
-    # ========================================================
 
     calculate_features(
         symbol
@@ -1090,11 +1057,6 @@ async def deriv_worker(symbol):
 
                     diag[symbol]["ticks"] += 1
 
-
-                    # =================================================
-                    # FEATURE CALCULATION
-                    # =================================================
-
                     calculate_features(
                         symbol
                     )
@@ -1166,6 +1128,7 @@ async def start(
         "👹🧠 AI МАНГАС V5 FIX\n\n"
         "7 INDEX LIVE + FEATURE ENGINE ✅\n"
         "MARKET STRUCTURE ON ✅\n\n"
+        "Move Strength FIX ON ✅\n\n"
         "History → Live Tick → Features → Structure\n\n"
         "/status"
     )
@@ -1242,9 +1205,6 @@ async def status(
                 ]
             )
 
-        # =====================================================
-        # MARKET STRUCTURE STATUS
-        # =====================================================
 
         if s["swing_high"] > 0:
 
@@ -1354,7 +1314,8 @@ async def rawstatus(
         f"{DERIV_PUBLIC_WS}\n\n"
         f"Active workers: "
         f"{len(active)}/7\n\n"
-        "FEATURE + MARKET STRUCTURE MODE"
+        "FEATURE + MARKET STRUCTURE MODE\n"
+        "MOVE STRENGTH FIX ON"
     )
 
 
