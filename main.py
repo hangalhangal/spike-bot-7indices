@@ -27,7 +27,7 @@ if not TOKEN:
 # ============================================================
 # AI МАНГАС V5 FIX
 # STEP 3 — FEATURE ENGINE
-# RSI FIX ONLY
+# RSI STABLE WILDER FIX
 # EXACT 7 BOOM / CRASH INDEX
 # ============================================================
 
@@ -211,8 +211,7 @@ def calculate_ema(prices, period):
 
 
 # ============================================================
-# RSI — STANDARD WILDER RSI
-# ONLY FIX IN THIS VERSION
+# RSI — STABLE WILDER RSI
 # ============================================================
 
 def calculate_rsi(prices, period=14):
@@ -220,30 +219,36 @@ def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return None
 
-    recent = prices[-(period + 1):]
+    # Use the full available history rather than
+    # calculating RSI from only the latest 15 ticks.
 
-    gains = []
-    losses = []
+    changes = []
 
-    for i in range(1, len(recent)):
+    for i in range(1, len(prices)):
 
         change = (
-            recent[i]
-            - recent[i - 1]
+            prices[i]
+            - prices[i - 1]
         )
 
-        if change > 0:
-
-            gains.append(change)
-            losses.append(0.0)
-
-        else:
-
-            gains.append(0.0)
-            losses.append(abs(change))
+        changes.append(change)
 
 
-    # Initial Wilder averages
+    if len(changes) < period:
+        return None
+
+
+    # Initial Wilder average
+
+    gains = [
+        max(change, 0.0)
+        for change in changes[:period]
+    ]
+
+    losses = [
+        max(-change, 0.0)
+        for change in changes[:period]
+    ]
 
     average_gain = (
         sum(gains)
@@ -256,6 +261,39 @@ def calculate_rsi(prices, period=14):
     )
 
 
+    # Wilder smoothing over the remaining history
+
+    for change in changes[period:]:
+
+        gain = max(
+            change,
+            0.0
+        )
+
+        loss = max(
+            -change,
+            0.0
+        )
+
+        average_gain = (
+            (
+                average_gain
+                * (period - 1)
+            )
+            + gain
+        ) / period
+
+        average_loss = (
+            (
+                average_loss
+                * (period - 1)
+            )
+            + loss
+        ) / period
+
+
+    # Final RSI
+
     if average_loss == 0:
 
         if average_gain == 0:
@@ -264,13 +302,25 @@ def calculate_rsi(prices, period=14):
         return 100.0
 
 
-    rs = (
+    relative_strength = (
         average_gain
         / average_loss
     )
 
-    return 100.0 - (
-        100.0 / (1.0 + rs)
+    rsi = 100.0 - (
+        100.0
+        / (1.0 + relative_strength)
+    )
+
+
+    # Safety clamp
+
+    return max(
+        0.0,
+        min(
+            100.0,
+            rsi
+        )
     )
 
 
@@ -405,7 +455,6 @@ def calculate_features(symbol):
     ]
 
     if len(prices) < 50:
-
         return False
 
     price = prices[-1]
