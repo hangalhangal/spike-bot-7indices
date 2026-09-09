@@ -144,18 +144,31 @@ score = {
 
 
 def keep_alive():
-    port = int(os.environ.get("PORT", "10000"))
 
-    class Handler(BaseHTTPRequestHandler):
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
+    )
+
+    class Handler(
+        BaseHTTPRequestHandler
+    ):
 
         def do_GET(self):
+
             self.send_response(200)
             self.end_headers()
+
             self.wfile.write(
                 b"AI MANGAS V5 FIX - SCORE ENGINE V1"
             )
 
-        def log_message(self, *args):
+        def log_message(
+            self,
+            *args
+        ):
             pass
 
     HTTPServer(
@@ -247,7 +260,10 @@ def reset_diag(symbol):
     ticks[symbol].clear()
 
 
-def calculate_ema(prices, period):
+def calculate_ema(
+    prices,
+    period
+):
 
     if len(prices) < period:
         return None
@@ -256,9 +272,13 @@ def calculate_ema(prices, period):
 
     ema = sum(values) / period
 
-    multiplier = 2.0 / (period + 1.0)
+    multiplier = (
+        2.0
+        / (period + 1.0)
+    )
 
     for price in values[1:]:
+
         ema = (
             (price - ema)
             * multiplier
@@ -268,30 +288,17 @@ def calculate_ema(prices, period):
     return ema
 
 
-# ============================================================
-# RSI V2 — SYNTHETIC CANDLE CLOSE
-# ============================================================
-#
-# ЗӨВХӨН RSI LOGIC ӨӨРЧЛӨГДСӨН.
-#
-# Deriv raw tick data
-#        ↓
-# 20 tick = 1 synthetic candle
-#        ↓
-# Candle close
-#        ↓
-# RSI 14
-#
-# Raw tick бүр дээр RSI тооцохгүй.
-# Ингэснээр tick noise RSI-г 0/100 руу
-# хэт хүчтэй шахах эрсдэлийг багасгана.
-# ============================================================
-
-def calculate_rsi(prices, period=14):
+def calculate_rsi(
+    prices,
+    period=14
+):
 
     TICKS_PER_CANDLE = 20
 
-    if not isinstance(prices, list):
+    if not isinstance(
+        prices,
+        list
+    ):
         return None
 
     clean_prices = []
@@ -314,16 +321,22 @@ def calculate_rsi(prices, period=14):
     ):
         return None
 
-    synthetic_closes = []
-
     usable_count = (
         len(clean_prices)
         // TICKS_PER_CANDLE
     ) * TICKS_PER_CANDLE
 
+    if usable_count < (
+        (period + 1)
+        * TICKS_PER_CANDLE
+    ):
+        return None
+
     usable_prices = clean_prices[
         :usable_count
     ]
+
+    candle_closes = []
 
     for start in range(
         0,
@@ -339,32 +352,24 @@ def calculate_rsi(prices, period=14):
         if len(chunk) != TICKS_PER_CANDLE:
             continue
 
-        close_price = chunk[-1]
+        candle_closes.append(
+            chunk[-1]
+        )
 
-        if math.isfinite(close_price):
-            synthetic_closes.append(
-                close_price
-            )
-
-    if len(synthetic_closes) < (
-        period + 1
-    ):
+    if len(candle_closes) < period + 1:
         return None
 
     changes = []
 
     for i in range(
         1,
-        len(synthetic_closes)
+        len(candle_closes)
     ):
 
-        change = (
-            synthetic_closes[i]
-            - synthetic_closes[i - 1]
+        changes.append(
+            candle_closes[i]
+            - candle_closes[i - 1]
         )
-
-        if math.isfinite(change):
-            changes.append(change)
 
     if len(changes) < period:
         return None
@@ -417,17 +422,12 @@ def calculate_rsi(prices, period=14):
             + loss
         ) / period
 
-    if (
-        average_gain == 0.0
-        and average_loss == 0.0
-    ):
-        return 50.0
+    if average_loss == 0:
 
-    if average_loss == 0.0:
+        if average_gain == 0:
+            return 50.0
+
         return 100.0
-
-    if average_gain == 0.0:
-        return 0.0
 
     relative_strength = (
         average_gain
@@ -445,25 +445,33 @@ def calculate_rsi(prices, period=14):
         )
     )
 
-    if not math.isfinite(rsi):
-        return 50.0
-
     return max(
         0.0,
-        min(100.0, rsi)
+        min(
+            100.0,
+            rsi
+        )
     )
 
 
-def calculate_atr(prices, period=14):
+def calculate_atr(
+    prices,
+    period=14
+):
 
     if len(prices) < period + 1:
         return None
 
-    recent = prices[-(period + 1):]
+    recent = prices[
+        -(period + 1):
+    ]
 
     true_ranges = []
 
-    for i in range(1, len(recent)):
+    for i in range(
+        1,
+        len(recent)
+    ):
 
         current = recent[i]
         previous = recent[i - 1]
@@ -480,7 +488,9 @@ def calculate_atr(prices, period=14):
         return None
 
     return (
-        sum(true_ranges[-period:])
+        sum(
+            true_ranges[-period:]
+        )
         / min(
             period,
             len(true_ranges)
@@ -488,12 +498,18 @@ def calculate_atr(prices, period=14):
     )
 
 
-def calculate_momentum(prices, period=10):
+def calculate_momentum(
+    prices,
+    period=10
+):
 
     if len(prices) <= period:
         return None
 
-    old_price = prices[-period - 1]
+    old_price = prices[
+        -period - 1
+    ]
+
     current_price = prices[-1]
 
     if old_price == 0:
@@ -508,16 +524,24 @@ def calculate_momentum(prices, period=10):
     ) * 100.0
 
 
-def calculate_volatility(prices, period=20):
+def calculate_volatility(
+    prices,
+    period=20
+):
 
     if len(prices) < period + 1:
         return None
 
     changes = []
 
-    recent = prices[-(period + 1):]
+    recent = prices[
+        -(period + 1):
+    ]
 
-    for i in range(1, len(recent)):
+    for i in range(
+        1,
+        len(recent)
+    ):
 
         previous = recent[i - 1]
         current = recent[i]
@@ -534,7 +558,10 @@ def calculate_volatility(prices, period=20):
     if len(changes) < 2:
         return 0.0
 
-    mean = sum(changes) / len(changes)
+    mean = (
+        sum(changes)
+        / len(changes)
+    )
 
     variance = (
         sum(
@@ -550,15 +577,17 @@ def calculate_volatility(prices, period=20):
     )
 
 
-# ============================================================
-# ADX / DMI — V5
-# ============================================================
-
-def calculate_adx_dmi(prices, period=14):
+def calculate_adx_dmi(
+    prices,
+    period=14
+):
 
     TICKS_PER_CANDLE = 20
 
-    if not isinstance(prices, list):
+    if not isinstance(
+        prices,
+        list
+    ):
         return None
 
     clean_prices = []
@@ -566,6 +595,7 @@ def calculate_adx_dmi(prices, period=14):
     for price in prices:
 
         try:
+
             value = float(price)
 
             if math.isfinite(value):
@@ -615,16 +645,11 @@ def calculate_adx_dmi(prices, period=14):
         if len(chunk) != TICKS_PER_CANDLE:
             continue
 
-        candle_open = chunk[0]
-        candle_high = max(chunk)
-        candle_low = min(chunk)
-        candle_close = chunk[-1]
-
         candles.append({
-            "open": candle_open,
-            "high": candle_high,
-            "low": candle_low,
-            "close": candle_close,
+            "open": chunk[0],
+            "high": max(chunk),
+            "low": min(chunk),
+            "close": chunk[-1],
         })
 
     if len(candles) < (
@@ -652,11 +677,14 @@ def calculate_adx_dmi(prices, period=14):
         previous_close = previous["close"]
 
         tr = max(
-            current_high - current_low,
+            current_high
+            - current_low,
+
             abs(
                 current_high
                 - previous_close
             ),
+
             abs(
                 current_low
                 - previous_close
@@ -690,15 +718,24 @@ def calculate_adx_dmi(prices, period=14):
             minus_dm = 0.0
 
         tr_values.append(
-            max(0.0, tr)
+            max(
+                0.0,
+                tr
+            )
         )
 
         plus_dm_values.append(
-            max(0.0, plus_dm)
+            max(
+                0.0,
+                plus_dm
+            )
         )
 
         minus_dm_values.append(
-            max(0.0, minus_dm)
+            max(
+                0.0,
+                minus_dm
+            )
         )
 
     if len(tr_values) < (
@@ -855,17 +892,26 @@ def calculate_adx_dmi(prices, period=14):
     return {
         "adx": max(
             0.0,
-            min(100.0, adx)
+            min(
+                100.0,
+                adx
+            )
         ),
 
         "plus_di": max(
             0.0,
-            min(100.0, latest_plus_di)
+            min(
+                100.0,
+                latest_plus_di
+            )
         ),
 
         "minus_di": max(
             0.0,
-            min(100.0, latest_minus_di)
+            min(
+                100.0,
+                latest_minus_di
+            )
         ),
     }
 
@@ -898,9 +944,15 @@ def calculate_market_structure(symbol):
     swing_lows = []
 
     start = SWING_LEFT
-    end = len(prices) - SWING_RIGHT
+    end = (
+        len(prices)
+        - SWING_RIGHT
+    )
 
-    for i in range(start, end):
+    for i in range(
+        start,
+        end
+    ):
 
         current = prices[i]
 
@@ -929,8 +981,13 @@ def calculate_market_structure(symbol):
                 (i, current)
             )
 
-    high_count = len(swing_highs)
-    low_count = len(swing_lows)
+    high_count = len(
+        swing_highs
+    )
+
+    low_count = len(
+        swing_lows
+    )
 
     structure[symbol][
         "swing_high_count"
@@ -948,11 +1005,13 @@ def calculate_market_structure(symbol):
         missing = []
 
         if high_count < 2:
+
             missing.append(
                 f"HIGH {high_count}/2"
             )
 
         if low_count < 2:
+
             missing.append(
                 f"LOW {low_count}/2"
             )
@@ -989,46 +1048,55 @@ def calculate_market_structure(symbol):
     current_price = prices[-1]
 
     high_is_higher = (
-        latest_high > previous_high
+        latest_high
+        > previous_high
     )
 
     low_is_higher = (
-        latest_low > previous_low
+        latest_low
+        > previous_low
     )
 
     high_is_lower = (
-        latest_high < previous_high
+        latest_high
+        < previous_high
     )
 
     low_is_lower = (
-        latest_low < previous_low
+        latest_low
+        < previous_low
     )
 
     if (
         high_is_higher
         and low_is_higher
     ):
+
         structure_name = "HH + HL"
 
     elif (
         high_is_lower
         and low_is_lower
     ):
+
         structure_name = "LH + LL"
 
     elif (
         high_is_higher
         and low_is_lower
     ):
+
         structure_name = "HH + LL"
 
     elif (
         high_is_lower
         and low_is_higher
     ):
+
         structure_name = "LH + HL"
 
     else:
+
         structure_name = "RANGE"
 
     bos = "NONE"
@@ -1040,9 +1108,11 @@ def calculate_market_structure(symbol):
     ):
 
         if current_price < latest_low:
+
             choch = "BEARISH"
 
         elif current_price > latest_high:
+
             bos = "BULLISH"
 
     elif (
@@ -1051,9 +1121,11 @@ def calculate_market_structure(symbol):
     ):
 
         if current_price > latest_high:
+
             choch = "BULLISH"
 
         elif current_price < latest_low:
+
             bos = "BEARISH"
 
     atr = features[symbol]["atr14"]
@@ -1066,7 +1138,9 @@ def calculate_market_structure(symbol):
         )
 
         start_price = (
-            prices[-lookback - 1]
+            prices[
+                -lookback - 1
+            ]
         )
 
         recent_price = prices[-1]
@@ -1089,9 +1163,11 @@ def calculate_market_structure(symbol):
             )
 
         else:
+
             move_strength = 0.0
 
     else:
+
         move_strength = 0.0
 
     structure[symbol] = {
@@ -1144,6 +1220,7 @@ def calculate_order_block(symbol):
     ]
 
     if len(prices) < 30:
+
         return {
             "bullish": 0,
             "bearish": 0,
@@ -1152,6 +1229,7 @@ def calculate_order_block(symbol):
     atr = features[symbol]["atr14"]
 
     if not atr or atr <= 0:
+
         return {
             "bullish": 0,
             "bearish": 0,
@@ -1192,6 +1270,7 @@ def calculate_fvg(symbol):
     ]
 
     if len(prices) < 10:
+
         return {
             "bullish": 0,
             "bearish": 0,
@@ -1200,6 +1279,7 @@ def calculate_fvg(symbol):
     atr = features[symbol]["atr14"]
 
     if not atr or atr <= 0:
+
         return {
             "bullish": 0,
             "bearish": 0,
@@ -1232,6 +1312,7 @@ def calculate_fvg(symbol):
                 p3 - p1
             ) >= atr * 2.0
         ):
+
             bullish = 1
 
         if (
@@ -1241,6 +1322,7 @@ def calculate_fvg(symbol):
                 p1 - p3
             ) >= atr * 2.0
         ):
+
             bearish = 1
 
     return {
@@ -1257,6 +1339,7 @@ def calculate_spike_analysis(symbol):
     ]
 
     if len(prices) < 50:
+
         return {
             "score": 0.0,
             "direction": "NONE",
@@ -1267,6 +1350,7 @@ def calculate_spike_analysis(symbol):
     atr = features[symbol]["atr14"]
 
     if not atr or atr <= 0:
+
         return {
             "score": 0.0,
             "direction": "NONE",
@@ -1277,7 +1361,10 @@ def calculate_spike_analysis(symbol):
     short_changes = []
 
     for i in range(
-        max(1, len(prices) - 10),
+        max(
+            1,
+            len(prices) - 10
+        ),
         len(prices)
     ):
 
@@ -1291,7 +1378,10 @@ def calculate_spike_analysis(symbol):
     long_changes = []
 
     for i in range(
-        max(1, len(prices) - 40),
+        max(
+            1,
+            len(prices) - 40
+        ),
         len(prices)
     ):
 
@@ -1304,12 +1394,18 @@ def calculate_spike_analysis(symbol):
 
     short_avg = (
         sum(short_changes)
-        / max(1, len(short_changes))
+        / max(
+            1,
+            len(short_changes)
+        )
     )
 
     long_avg = (
         sum(long_changes)
-        / max(1, len(long_changes))
+        / max(
+            1,
+            len(long_changes)
+        )
     )
 
     if long_avg > 0:
@@ -1320,6 +1416,7 @@ def calculate_spike_analysis(symbol):
         )
 
     else:
+
         compression_ratio = 1.0
 
     recent_move = abs(
@@ -1347,36 +1444,46 @@ def calculate_spike_analysis(symbol):
     direction = "NONE"
 
     if compression_ratio < 0.75:
+
         score_value += 20.0
 
     elif compression_ratio < 0.90:
+
         score_value += 10.0
 
     if expansion_ratio >= 3.0:
+
         score_value += 25.0
 
     elif expansion_ratio >= 2.0:
+
         score_value += 15.0
 
-    momentum = features[symbol]["momentum10"]
+    momentum = features[symbol][
+        "momentum10"
+    ]
 
     if symbol_is_boom:
 
         if momentum < 0:
+
             score_value += 20.0
             direction = "UP_SPIKE"
 
         elif momentum > 0:
+
             score_value += 5.0
             direction = "UP_SPIKE"
 
     elif symbol_is_crash:
 
         if momentum > 0:
+
             score_value += 20.0
             direction = "DOWN_SPIKE"
 
         elif momentum < 0:
+
             score_value += 5.0
             direction = "DOWN_SPIKE"
 
@@ -1423,7 +1530,9 @@ def calculate_advanced_analysis(symbol):
         advanced[symbol]["plus_di"] = 0.0
         advanced[symbol]["minus_di"] = 0.0
 
-    ob = calculate_order_block(symbol)
+    ob = calculate_order_block(
+        symbol
+    )
 
     advanced[symbol]["ob_bullish"] = (
         ob["bullish"]
@@ -1433,7 +1542,9 @@ def calculate_advanced_analysis(symbol):
         ob["bearish"]
     )
 
-    fvg = calculate_fvg(symbol)
+    fvg = calculate_fvg(
+        symbol
+    )
 
     advanced[symbol]["fvg_bullish"] = (
         fvg["bullish"]
@@ -1494,29 +1605,58 @@ def calculate_signal_score(symbol):
         component_buy["trend"] = 0.0
         component_sell["trend"] = 0.0
 
+    # ========================================================
+    # RSI CONFIRMATION FIX
+    # RSI can ONLY confirm the existing direction.
+    # RSI can NEVER create an opposite-direction score.
+    # ========================================================
+
+    momentum = f["momentum10"]
+
     rsi = f["rsi14"]
 
     if rsi <= 20:
 
-        buy += 10.0
-        component_buy["rsi"] = 10.0
+        if (
+            f["trend"] == "BULLISH"
+            and momentum > 0
+        ):
+
+            buy += 10.0
+            component_buy["rsi"] = 10.0
 
     elif rsi <= 30:
 
-        buy += 6.0
-        component_buy["rsi"] = 6.0
+        if (
+            f["trend"] == "BULLISH"
+            and momentum > 0
+        ):
+
+            buy += 6.0
+            component_buy["rsi"] = 6.0
 
     elif rsi >= 80:
 
-        sell += 10.0
-        component_sell["rsi"] = 10.0
+        if (
+            f["trend"] == "BEARISH"
+            and momentum < 0
+        ):
+
+            sell += 10.0
+            component_sell["rsi"] = 10.0
 
     elif rsi >= 70:
 
-        sell += 6.0
-        component_sell["rsi"] = 6.0
+        if (
+            f["trend"] == "BEARISH"
+            and momentum < 0
+        ):
 
-    momentum = f["momentum10"]
+            sell += 6.0
+            component_sell["rsi"] = 6.0
+
+    # RSI 30-70 = NO RSI SCORE
+    # RSI conflicts with trend/momentum = NO RSI SCORE
 
     if momentum > 0:
 
@@ -1601,19 +1741,25 @@ def calculate_signal_score(symbol):
             sell += 10.0
             component_sell["sr"] = 10.0
 
-    move_strength = s["move_strength"]
+    move_strength = s[
+        "move_strength"
+    ]
 
     if move_strength >= 4.0:
 
         if f["direction"] == "UP":
 
             buy += 5.0
-            component_buy["move_strength"] = 5.0
+            component_buy[
+                "move_strength"
+            ] = 5.0
 
         elif f["direction"] == "DOWN":
 
             sell += 5.0
-            component_sell["move_strength"] = 5.0
+            component_sell[
+                "move_strength"
+            ] = 5.0
 
     adx = a["adx14"]
     plus_di = a["plus_di"]
@@ -1663,7 +1809,9 @@ def calculate_signal_score(symbol):
         sell += 5.0
         component_sell["fvg"] = 5.0
 
-    spike_score = a["spike_score"]
+    spike_score = a[
+        "spike_score"
+    ]
 
     if spike_score >= 40:
 
@@ -1689,8 +1837,15 @@ def calculate_signal_score(symbol):
             sell += 2.5
             component_sell["spike"] = 2.5
 
-    buy = min(100.0, buy)
-    sell = min(100.0, sell)
+    buy = min(
+        100.0,
+        buy
+    )
+
+    sell = min(
+        100.0,
+        sell
+    )
 
     difference = abs(
         buy - sell
@@ -1701,7 +1856,10 @@ def calculate_signal_score(symbol):
         sell
     )
 
-    if highest >= 80 and difference >= 20:
+    if (
+        highest >= 80
+        and difference >= 20
+    ):
 
         if buy > sell:
             decision = "BUY WATCH"
@@ -1710,7 +1868,10 @@ def calculate_signal_score(symbol):
 
         strength = "VERY HIGH"
 
-    elif highest >= 70 and difference >= 15:
+    elif (
+        highest >= 70
+        and difference >= 15
+    ):
 
         if buy > sell:
             decision = "BUY WATCH"
@@ -1719,7 +1880,10 @@ def calculate_signal_score(symbol):
 
         strength = "HIGH"
 
-    elif highest >= 55 and difference >= 10:
+    elif (
+        highest >= 55
+        and difference >= 10
+    ):
 
         if buy > sell:
             decision = "BUY BIAS"
@@ -1924,24 +2088,31 @@ def calculate_features(symbol):
         or momentum10 is None
         or volatility20 is None
     ):
+
         return False
 
     if ema20 > ema50:
+
         trend = "BULLISH"
 
     elif ema20 < ema50:
+
         trend = "BEARISH"
 
     else:
+
         trend = "NEUTRAL"
 
     if momentum10 > 0:
+
         direction = "UP"
 
     elif momentum10 < 0:
+
         direction = "DOWN"
 
     else:
+
         direction = "FLAT"
 
     features[symbol] = {
@@ -1980,7 +2151,10 @@ def process_history(
     times=None
 ):
 
-    if not isinstance(prices, list):
+    if not isinstance(
+        prices,
+        list
+    ):
 
         raise RuntimeError(
             "History prices is not a list"
@@ -1992,14 +2166,22 @@ def process_history(
             "History returned 0 prices"
         )
 
-    diag[symbol]["history"] = len(prices)
+    diag[symbol]["history"] = len(
+        prices
+    )
 
     ticks[symbol].clear()
 
-    if isinstance(times, list):
+    if isinstance(
+        times,
+        list
+    ):
 
         pairs = list(
-            zip(times, prices)
+            zip(
+                times,
+                prices
+            )
         )
 
     else:
