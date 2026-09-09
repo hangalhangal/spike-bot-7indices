@@ -239,43 +239,123 @@ async def send_signal(app,k,direction,conf,probs):
 
 async def deriv_ws(symbol,k,app):
     uri="wss://ws.binaryws.com/websockets/v3?app_id=1089"
-    async with websockets.connect(uri,ping_interval=20,ping_timeout=20,close_timeout=10) as ws:
-        await ws.send(json.dumps({"ticks_history":symbol,"count":WARMUP_HISTORY,"end":"latest","style":"ticks"}))
-        await ws.send(json.dumps({"ticks":symbol,"subscribe":1}))
-        logging.info("%s CONNECTED",k)
-        while k in active:
-            msg=json.loads(await ws.recv())
-            if "history" in msg:
-                ps=msg["history"].get("prices",[]);ts=msg["history"].get("times",[])
-                history_data[k]=[(float(ts[i]),float(x)) for i,x in enumerate(ps) if i<len(ts)]
-                for item in history_data[k][-LIVE_HISTORY:]:ticks_data[k].append(item)
-                await asyncio.to_thread(warmup,k)
-            if "tick" in msg:
-                try:
-                    t=msg["tick"];price=float(t["quote"]);timestamp=float(t.get("epoch",time.time()))
-                except Exception:continue
-                diag[k]["ticks"]+=1;diag[k]["last_tick"]=timestamp;ticks_data[k].append((timestamp,price))
-                ps=[x[1] for x in ticks_data[k]]
-                if len(ps)<210:continue
-                await evaluate(k,timestamp)
-                try:f=features(ps)
-                except Exception as e:
-                    diag[k]["errors"]+=1;diag[k]["last_error"]=str(e);continue
-                if f is None:continue
-                diag[k]["features"]+=1
-                c,conf,probs=predict(k,f);last_probs[k]=probs;last_class[k]=c;diag[k]["last_confidence"]=conf
-                if c!=0:diag[k]["candidates"]+=1
-                if not allowed(k,c,conf):continue
-                direction="BUY" if c==1 else "SELL"
-                pending[k].append({"time":timestamp,"price":price,"direction":direction,"features":f,"confidence":conf})
-                last_signal[k]=time.time();diag[k]["signals"]+=1
-                await send_signal(app,k,direction,conf,probs)
+    diag[k]["last_error"]=""
+    try:
+        async with websockets.connect(uri,ping_interval=20,ping_timeout=20,close_timeout=10) as ws:
+            diag[k]["connected"]=1
+            diag[k]["last_msg_type"]="CONNECTED"
+            logging.info("%s CONNECTED",k)
+
+            await ws.send(json.dumps({
+                "ticks_history":symbol,
+                "count":WARMUP_HISTORY,
+                "end":"latest",
+                "style":"ticks",
+                "subscribe":0
+            }))
+            diag[k]["last_msg_type"]="HISTORY_REQUESTED"
+
+            await ws.send(json.dumps({
+                "ticks":symbol,
+                "subscribe":1
+            }))
+            diag[k]["subscribed"]=1
+            diag[k]["last_msg_type"]="SUBSCRIBED"
+
+            while k in active:
+                raw=await ws.recv()
+                msg=json.loads(raw)
+
+                if "error" in msg:
+                    err=msg["error"]
+                    diag[k]["errors"]+=1
+                    diag[k]["last_error"]=str(err.get("message",err))
+                    diag[k]["last_msg_type"]="ERROR"
+                    logging.error("%s Deriv error: %s",k,diag[k]["last_error"])
+                    continue
+
+                if "history" in msg:
+                    ps=msg["history"].get("prices",[])
+                    ts=msg["history"].get("times",[])
+                    history_data[k]=[(float(ts[i]),float(x)) for i,x in enumerate(ps) if i<len(ts)]
+                    diag[k]["history"]=len(history_data[k])
+                    diag[k]["last_msg_type"]="HISTORY"
+                    for item in history_data[k][-LIVE_HISTORY:]:
+                        ticks_data[k].append(item)
+                    await asyncio.to_thread(warmup,k)
+
+                if "tick" in msg:
+                    t=msg["tick"]
+                    try:
+                        price=float(t["quote"])
+                        timestamp=float(t.get("epoch",time.time()))
+                    except Exception as e:
+                        diag[k]["errors"]+=1
+                        diag[k]["last_error"]=f"tick parse: {e}"
+                        diag[k]["last_msg_type"]="TICK_PARSE_ERROR"
+                        continue
+
+                    diag[k]["ticks"]+=1
+                    diag[k]["last_tick"]=timestamp
+                    diag[k]["last_msg_type"]="LIVE_TICK"
+                    ticks_data[k].append((timestamp,price))
+
+                    ps=[x[1] for x in ticks_data[k]]
+                    if len(ps)<210:
+                        continue
+
+                    await evaluate(k,timestamp)
+                    try:
+                        f=features(ps)
+                    except Exception as e:
+                        diag[k]["errors"]+=1
+                        diag[k]["last_error"]=str(e)
+                        diag[k]["last_msg_type"]="FEATURE_ERROR"
+                        continue
+
+                    if f is None:
+                        continue
+
+                    diag[k]["features"]+=1
+                    c,conf,probs=predict(k,f)
+                    last_probs[k]=probs
+                    last_class[k]=c
+                    diag[k]["last_confidence"]=conf
+
+                    if c!=0:
+                        diag[k]["candidates"]+=1
+
+                    if not allowed(k,c,conf):
+                        continue
+
+                    direction="BUY" if c==1 else "SELL"
+                    pending[k].append({
+                        "time":timestamp,
+                        "price":price,
+                        "direction":direction,
+                        "features":f,
+                        "confidence":conf
+                    })
+                    last_signal[k]=time.time()
+                    diag[k]["signals"]+=1
+                    await send_signal(app,k,direction,conf,probs)
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        diag[k]["errors"]+=1
+        diag[k]["last_error"]=f"{type(e).__name__}: {e}"
+        diag[k]["last_msg_type"]="WS_EXCEPTION"
+        logging.error("%s websocket exception: %s",k,e)
+        raise
 
 async def start_ws(symbol,k,app):
     while k in active:
         try:await deriv_ws(symbol,k,app)
         except asyncio.CancelledError:return
         except Exception as e:
+            diag[k]["last_error"]=f"{type(e).__name__}: {e}"
+            diag[k]["last_msg_type"]="RECONNECTING"
             logging.error("%s websocket: %s",k,e)
             if k in active:await asyncio.sleep(5)
 
@@ -323,6 +403,8 @@ async def status(update,context):
               f"Last: {['NO SPIKE','UP SPIKE','DOWN SPIKE'][last_class[k]]} | Confidence: {diag[k]['last_confidence']*100:.1f}%\n"
               f"Prob UP: {p[1]*100:.1f}% | DOWN: {p[2]*100:.1f}% | NO SPIKE: {p[0]*100:.1f}%\n"
               f"Signals: {diag[k]['signals']} | Errors: {diag[k]['errors']}\n"
+              f"WS: C{diag[k]['connected']} H{diag[k]['history']} S{diag[k]['subscribed']} | LastMsg: {diag[k]['last_msg_type']}\n"
+              f"LastError: {diag[k]['last_error'] or '-'}\n"
               f"Blocked confidence: {diag[k]['blocked_confidence']} | cooldown: {diag[k]['blocked_cooldown']}\n\n")
     await update.message.reply_text(msg+"━━━━━━━━━━━━━━━━━━\n🟢 Active: "+str(len(active))+"/7\n🧠 Online learning: ON\n💾 Persistent memory: ON\n🎯 Diagnostic confidence: 40%")
 
