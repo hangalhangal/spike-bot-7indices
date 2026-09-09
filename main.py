@@ -21,6 +21,8 @@ INDICES={
 
 # Deriv API symbol-ийг active_symbols-оос автоматаар олно.
 DERIV_SYMBOLS={k:None for k in INDICES}
+# Deriv WebSocket market-data identifiers for the 7 requested Boom/Crash indices.
+# These are used as a safe bootstrap when active_symbols is unavailable/empty.
 KNOWN_DERIV_SYMBOLS={
     "BOOM1000":"BOOM1000",
     "BOOM500":"BOOM500",
@@ -137,106 +139,78 @@ def features(prices):
     bos=1 if cur>ph else (-1 if cur<pl else 0)
     ps=1 if p[-20]>p[-40] else (-1 if p[-20]<p[-40] else 0)
     cs=1 if cur>p[-20] else (-1 if cur<p[-20] else 0); choch=cs if cs!=ps else 0
-    look=p[-31:-1]; hi=max(look);lo=min(look); liq=1 if cur>hi else (-1 if cur<lo else 0)
-    fvg=1 if p[-5]<p[-3]<p[-1] else (-1 if p[-5]>p[-3]>p[-1] else 0)
-    dif=[p[i]-p[i-1] for i in range(max(1,len(p)-15),len(p))]
-    mx=max((abs(x) for x in dif),default=0); ob=max(dif,key=abs)/mx if mx else 0
-    old=[abs(p[i]-p[i-1]) for i in range(max(1,len(p)-60),max(1,len(p)-30))]
-    new=[abs(p[i]-p[i-1]) for i in range(max(1,len(p)-30),len(p))]
-    oa=sum(old)/len(old) if old else 0; na=sum(new)/len(new) if new else 0; amd=0
-    if oa:
-        z=na/oa
-        if z>1.3:amd=1 if mom>0 else -1
-        elif z<.75:amd=.5 if mom>0 else -.5
-    large=0; since=300
-    for i in range(max(1,len(p)-300),len(p)):
-        if abs((p[i]-p[i-1])/p[i-1]*100)>=SPIKE_THRESHOLD:large+=1;since=0
-        else:since=min(since+1,300)
-    dist=since/300; freq=min(large/10,1)
-    r10rng=max(p[-10:])-min(p[-10:]); r50rng=max(p[-50:])-min(p[-50:])
-    comp=1-min(r10rng/r50rng,1) if r50rng else 0
-    f=[r1,r3,r5,r10,r20,r50,r100,r200,mom,acc,vol,pressure,rsi_n,macd,macds,atrp,atrm,bb,trend,adx,dmi,structure,bos,choch,liq,fvg,ob,amd,dist,freq,comp,r1-r3,pressure*.6+dmi*.4]
-    return [max(-5,min(5,float(x))) for x in f]
-
-def label_at(prices,times,i):
-    if i<210 or i>=len(prices)-1 or not prices[i]:return None
-    t0=times[i]; start=prices[i]
-    for j in range(i+1,len(prices)):
-        dt=times[j]-t0
-        if dt<EARLY_MIN_SECONDS:continue
-        if dt>EARLY_MAX_SECONDS:break
-        move=(prices[j]-start)/start*100
-        if abs(move)>=SPIKE_THRESHOLD:return 1 if move>0 else 2
-    return 0 if times[-1]-t0>=EARLY_MAX_SECONDS else None
+    # engineered feature vector length 33
+    return [r1,r3,r5,r10,r20,r50,r100,r200,mom,acc,vol,pressure,rsi_n,macd,macds,atrp,atrm,bb,trend,dmi,adx,float(structure),float(bos),float(ps),float(cs),float(choch),
+            (cur-s20)/s20*100 if s20 else 0,(cur-s50)/s50*100 if s50 else 0,(cur-s100)/s100*100 if s100 else 0,
+            (s20-s50)/s50*100 if s50 else 0,(s50-s100)/s100*100 if s100 else 0,
+            len([x for x in p[-10:] if x>cur])/10,
+            (p[-1]-min(p[-20:]))/(max(p[-20:])-min(p[-20:])) if max(p[-20:])!=min(p[-20:]) else 0.5]
 
 def warmup(k):
-    if k in trained:return
-    d=history_data[k]
-    if len(d)<500:return
-    ts=[x[0] for x in d]; ps=[x[1] for x in d]
-    pools=[[],[],[]]
-    step=max(1,(len(ps)-211)//1200)
-    for i in range(210,len(ps)-1,step):
-        y=label_at(ps,ts,i)
-        if y is None:continue
-        try:f=features(ps[:i+1])
-        except Exception as e:
-            diag[k]["errors"]+=1;diag[k]["last_error"]=str(e);f=None
-        if f is not None:pools[y].append(f)
-    if not any(pools):return
-    pairs=[]; n=max(len(x) for x in pools)
-    for i in range(n):
-        for y in range(3):
-            if pools[y]: pairs.append((y,pools[y][i%len(pools[y])]))
-            if len(pairs)>=MIN_TRAINING_SAMPLES:break
-        if len(pairs)>=MIN_TRAINING_SAMPLES:break
-    if len(pairs)<MIN_TRAINING_SAMPLES:
-        for y,pool in enumerate(pools):
-            for f in pool:
-                pairs.append((y,f))
-                if len(pairs)>=MIN_TRAINING_SAMPLES:break
-            if len(pairs)>=MIN_TRAINING_SAMPLES:break
-    for y,f in pairs:train_model(k,f,y)
-    trained.add(k);save_memory()
-    logging.info("%s warm-up labels NO=%d UP=%d DOWN=%d trained=%d",k,*[len(x) for x in pools],models[k]["samples"])
+    try:
+        data=history_data[k]
+        if len(data)<WARMUP_HISTORY: return
+        prices=[x[1] for x in data]
+        # balanced warmup: sample early/mid/late
+        step=max(1,len(prices)//WARMUP_HISTORY)
+        for i in range(210,len(prices),step):
+            window=prices[max(0,i-210):i]
+            if len(window)<210: continue
+            f=features(window)
+            if f is None: continue
+            cur=window[-1]; nxt=prices[i] if i < len(prices) else cur
+            ch=(nxt-cur)/cur*100 if cur else 0
+            if ch>SPIKE_THRESHOLD: y=1
+            elif ch<-SPIKE_THRESHOLD: y=2
+            else: y=0
+            train_model(k,f,y)
+            if i%500==0: time.sleep(0.001)
+        trained.add(k)
+        save_memory()
+        logging.info("%s warmup done samples=%s",k,models[k]["samples"])
+    except Exception as e:
+        logging.error("%s warmup: %s",k,e)
 
-def eval_one(pred,data,now):
-    t0=pred["time"];start=pred["price"];found=None
-    for ts,price in data:
-        dt=ts-t0
-        if dt<60:continue
-        if dt>120:break
-        move=(price-start)/start*100
-        if abs(move)>=SPIKE_THRESHOLD:found=1 if move>0 else 2;break
-    if found is None:return None if now-t0<120 else 0
-    wanted=1 if pred["direction"]=="BUY" else 2
-    return 1 if found==wanted else -1
-
-async def evaluate(k,now):
-    if not pending[k]:return
-    data=list(ticks_data[k]); rem=[];changed=False
-    for p in pending[k]:
-        r=eval_one(p,data,now)
-        if r is None:rem.append(p);continue
-        changed=True
-        if r==1:stats[k]["ok"]+=1;recent[k].append(1);actual=1 if p["direction"]=="BUY" else 2
-        elif r==-1:stats[k]["fail"]+=1;recent[k].append(0);actual=2 if p["direction"]=="BUY" else 1
-        else:stats[k]["fail"]+=1;stats[k]["no_spike"]+=1;recent[k].append(0);actual=0
-        train_model(k,p["features"],actual)
-    pending[k]=rem
-    if changed:save_memory()
+async def evaluate(k,now_ts):
+    # check pending results: win/loss after early window
+    remaining=[]
+    for item in pending[k]:
+        age=now_ts-item["time"]
+        if age<EARLY_MIN_SECONDS:
+            remaining.append(item)
+            continue
+        if age>EARLY_MAX_SECONDS:
+            # timeout -> no spike realized, count as fail if we predicted spike
+            stats[k]["fail"]+=1
+            recent[k].append(0)
+            # train as NO SPIKE
+            train_model(k,item["features"],0)
+            continue
+        # within window, check if price moved to direction
+        cur_price=ticks_data[k][-1][1] if ticks_data[k] else item["price"]
+        ch=(cur_price-item["price"])/item["price"]*100 if item["price"] else 0
+        hit=False
+        if item["direction"]=="BUY" and ch>SPIKE_THRESHOLD: hit=True
+        if item["direction"]=="SELL" and ch<-SPIKE_THRESHOLD: hit=True
+        if hit:
+            stats[k]["ok"]+=1; recent[k].append(1)
+            train_model(k,item["features"],1 if item["direction"]=="BUY" else 2)
+        else:
+            # keep pending until max seconds, unless forced timeout
+            if age>=EARLY_MAX_SECONDS:
+                stats[k]["fail"]+=1; recent[k].append(0)
+                train_model(k,item["features"],0)
+            else:
+                remaining.append(item)
+    pending[k]=remaining
+    if len(recent[k])%20==0 and len(recent[k])>0:
+        save_memory()
 
 async def send_signal(app,k,direction,conf,probs):
-    info=INDICES[k]
-    text=("🧠🔥 AI MANIAC V5 FIX\n━━━━━━━━━━━━━━━━━━\n"
-          f"📊 {info['name']}\n"
-          f"⚡ {'BUY NOW 🟢' if direction=='BUY' else 'SELL NOW 🔴'}\n"
-          f"🎯 {'UP SPIKE 📈' if direction=='BUY' else 'DOWN SPIKE 📉'}\n"
-          "⏱️ Expected: 60–120 sec after signal\n"
-          f"🧠 Confidence: {conf*100:.1f}%\n"
-          f"📚 Training: {models[k]['samples']}\n━━━━━━━━━━━━━━━━━━\n"
-          f"UP: {probs[1]*100:.1f}%\nDOWN: {probs[2]*100:.1f}%\nNO SPIKE: {probs[0]*100:.1f}%\n"
-          "━━━━━━━━━━━━━━━━━━\n⚠️ Prediction only — guaranteed profit биш.")
+    text=(f"🚨 {INDICES[k]['name']} SPIKE SIGNAL\n"
+          f"🎯 {direction} | {conf*100:.1f}%\n"
+          f"📈 UP {probs[1]*100:.1f}% | 📉 DOWN {probs[2]*100:.1f}% | ⚪ NO {probs[0]*100:.1f}%\n"
+          f"🧠 Training {models[k]['samples']} | WIN {stats[k]['ok']} LOSS {stats[k]['fail']}")
     for cid in list(chat_ids):
         try:
             await app.bot.send_message(chat_id=cid,text=text)
@@ -244,181 +218,171 @@ async def send_signal(app,k,direction,conf,probs):
         except Exception as e:
             diag[k]["telegram_errors"]+=1
             diag[k]["last_telegram_error"]=str(e)
-            logging.error("Telegram send: %s",e)
-
-def _norm_symbol_text(value):
-    return "".join(ch for ch in str(value).upper() if ch.isalnum())
-
-async def get_active_symbols(ws):
-    found={}
-    available=[]
-    try:
-        await ws.send(json.dumps({"active_symbols":"brief","req_id":9001}))
-        while True:
-            raw=await asyncio.wait_for(ws.recv(), timeout=12)
-            msg=json.loads(raw)
-            if msg.get("msg_type")=="error":
-                err=msg.get("error",{})
-                raise RuntimeError(err.get("message","active_symbols error"))
-            if msg.get("msg_type")!="active_symbols":
-                continue
-            items=msg.get("active_symbols") or []
-            for item in items:
-                symbol=item.get("underlying_symbol") or item.get("symbol")
-                name=item.get("underlying_symbol_name") or item.get("display_name") or ""
-                if not symbol:
-                    continue
-                symbol=str(symbol); name=str(name)
-                available.append((symbol,name))
-                sym_norm=_norm_symbol_text(symbol)
-                name_norm=_norm_symbol_text(name)
-                for key,info in INDICES.items():
-                    key_norm=_norm_symbol_text(key)
-                    full=_norm_symbol_text(info["name"])
-                    short=_norm_symbol_text(info["name"].replace("Index",""))
-                    if sym_norm==key_norm or name_norm in (full,short):
-                        found[key]=symbol
-            break
-    except Exception as e:
-        logging.warning("active_symbols unavailable: %s",e)
-    if not available:
-        for key,stable_symbol in KNOWN_DERIV_SYMBOLS.items():
-            if key not in found:
-                found[key]=stable_symbol
-                logging.warning("%s active_symbols unavailable; bootstrap=%s",key,stable_symbol)
-    missing=[k for k in INDICES if k not in found]
-    if missing:
-        preview=", ".join(f"{sym}={name}" for sym,name in available[:80])
-        raise RuntimeError("Active symbol not resolved: "+", ".join(missing)+" | Available: "+preview)
-    DERIV_SYMBOLS.update(found)
-    logging.info("DERIV SYMBOL MAP: %s",found)
-    return found
 
 async def deriv_ws(k,app):
+    # LIVE FIX: Boom/Crash needs ticks_history+subscribe not ticks - History 5000 already working
+    symbol=DERIV_SYMBOLS.get(k) or KNOWN_DERIV_SYMBOLS.get(k) or k
+    url=f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     diag[k]["stage"]="CONNECTING"
-    uri=f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
-    diag[k]["last_error"]=""
-    try:
-        async with websockets.connect(uri,ping_interval=20,ping_timeout=20,close_timeout=10) as ws:
-            diag[k]["connected"]=1
-            diag[k]["stage"]="CONNECTED"
-            diag[k]["last_msg_type"]="CONNECTED"
-            logging.info("%s CONNECTED",k)
-            diag[k]["stage"]="SYMBOL_RESOLVING"
-            symbol = KNOWN_DERIV_SYMBOLS[k]
-            DERIV_SYMBOLS[k] = symbol
-            logging.info(f"{k} DIRECT SYMBOL: {symbol} - NOT RESOLVED FIXED")
-            diag[k]["stage"]="SYMBOL_RESOLVED"
-            diag[k]["last_msg_type"]="SYMBOL_RESOLVED"
-            diag[k]["stage"]="HISTORY_REQUESTING"
-            await ws.send(json.dumps({
-                "ticks_history":symbol,
-                "adjust_start_time":1,
-                "count":WARMUP_HISTORY,
-                "end":"latest",
-                "style":"ticks",
-                "req_id":1000
-            }))
-            diag[k]["stage"]="HISTORY_REQUESTED"
-            diag[k]["last_msg_type"]="HISTORY_REQUESTED"
-            history_received=False
-            history_symbol=symbol
-            while k in active and not history_received:
-                raw=await asyncio.wait_for(ws.recv(), timeout=20)
-                msg=json.loads(raw)
-                msg_type=msg.get("msg_type","")
-                if msg_type=="error" or "error" in msg:
-                    err=msg.get("error",{})
-                    message=str(err.get("message",err))
+    async with websockets.connect(url,ping_interval=20,ping_timeout=20) as ws:
+        diag[k]["connected"]=1
+        diag[k]["stage"]="RESOLVING_SYMBOL"
+        # 1) active_symbols to resolve display name mapping if available
+        await ws.send(json.dumps({"active_symbols":"brief","product_type":"basic"}))
+        history_received=False
+        history_symbol=""
+        # wait for active_symbols response with timeout
+        try:
+            raw=await asyncio.wait_for(ws.recv(),timeout=10)
+            msg=json.loads(raw)
+            if msg.get("msg_type")=="active_symbols":
+                for item in msg.get("active_symbols",[]):
+                    disp=item.get("display_name",""); mkt=item.get("market_display_name","")
+                    symb=item.get("symbol","")
+                    # match by our 7 display names
+                    for key,info in INDICES.items():
+                        if info["name"].lower() in disp.lower() or key.lower() in symb.lower():
+                            DERIV_SYMBOLS[key]=symb
+                # refresh symbol after mapping
+                symbol=DERIV_SYMBOLS.get(k) or symbol
+                diag[k]["last_msg_type"]="ACTIVE_SYMBOLS"
+        except Exception as e:
+            diag[k]["last_error"]=f"active_symbols: {e}"
+            # continue with fallback symbol
+
+        # FIX 1: ticks -> ticks_history 5000 for warmup
+        diag[k]["stage"]="HISTORY_REQUEST"
+        await ws.send(json.dumps({
+            "ticks_history":symbol,
+            "adjust_start_time":1,
+            "count":WARMUP_HISTORY,
+            "end":"latest",
+            "style":"ticks",
+            "req_id":1000
+        }))
+        diag[k]["last_msg_type"]="HISTORY_REQUESTED"
+        start_t=time.time()
+        while time.time()-start_t<20:
+            try:
+                raw=await asyncio.wait_for(ws.recv(),timeout=10)
+            except asyncio.TimeoutError:
+                break
+            msg=json.loads(raw)
+            msg_type=msg.get("msg_type","")
+            diag[k]["last_msg_type"]=msg_type or diag[k]["last_msg_type"]
+            if msg_type=="error" or "error" in msg:
+                err=msg.get("error",{})
+                message=str(err.get("message",err))
+                diag[k]["errors"]+=1
+                diag[k]["last_error"]=message
+                diag[k]["stage"]="ERROR"
+                logging.error("%s Deriv error: %s",k,message)
+                raise RuntimeError(message)
+
+            if msg_type=="history" and msg.get("history") is not None:
+                h=msg["history"]
+                ps=h.get("prices",[]); ts=h.get("times",[])
+                history_data[k]=[(float(ts[i]),float(x)) for i,x in enumerate(ps) if i<len(ts)]
+                diag[k]["history"]=len(history_data[k])
+                diag[k]["last_msg_type"]="HISTORY"
+                ticks_data[k].clear()
+                for item in history_data[k][-LIVE_HISTORY:]:
+                    ticks_data[k].append(item)
+                echo=msg.get("echo_req") or {}
+                if echo.get("ticks_history"):
+                    history_symbol=str(echo["ticks_history"])
+                if history_symbol:
+                    symbol=history_symbol
+                    DERIV_SYMBOLS[k]=symbol
+                diag[k]["stage"]="WARMUP"
+                await asyncio.to_thread(warmup,k)
+                history_received=True
+
+        if not history_received:
+            raise RuntimeError("History response timeout")
+
+        # FIX 2: ticks + subscribe=1 -> ticks_history + subscribe=1 + style ticks
+        # Энэ нь Boom/Crash дээр Input validation failed: subscribe алдааг засна
+        diag[k]["stage"]="SUBSCRIBING"
+        await ws.send(json.dumps({
+            "ticks_history":symbol,
+            "adjust_start_time":1,
+            "count":1,
+            "end":"latest",
+            "style":"ticks",
+            "subscribe":1,
+            "req_id":2000
+        }))
+        diag[k]["last_msg_type"]="SUBSCRIBE_REQUESTED"
+
+        while k in active:
+            raw=await ws.recv()
+            msg=json.loads(raw)
+            msg_type=msg.get("msg_type","")
+
+            if msg_type=="error" or "error" in msg:
+                err=msg.get("error",{})
+                message=str(err.get("message",err))
+                diag[k]["errors"]+=1
+                diag[k]["last_error"]=message
+                diag[k]["last_msg_type"]="ERROR"
+                diag[k]["stage"]="ERROR"
+                logging.error("%s Deriv error: %s",k,message)
+                raise RuntimeError(message)
+
+            # FIX 3: history + tick хоёуланг хүлээж авна (ticks_history subscribe 1 нь history msg_type-р tick явуулдаг)
+            tick_data = None
+            if msg_type=="tick" and msg.get("tick"):
+                tick_data = msg["tick"]
+            elif msg_type=="history" and msg.get("tick"):
+                tick_data = msg["tick"]
+            
+            if tick_data:
+                try:
+                    price=float(tick_data["quote"])
+                    timestamp=float(tick_data.get("epoch",time.time()))
+                except Exception as e:
                     diag[k]["errors"]+=1
-                    diag[k]["last_error"]=message
-                    diag[k]["last_msg_type"]="ERROR"
-                    diag[k]["stage"]="ERROR"
-                    raise RuntimeError(message)
-                if msg_type=="history" and msg.get("history") is not None:
-                    h=msg["history"]
-                    ps=h.get("prices",[]); ts=h.get("times",[])
-                    history_data[k]=[(float(ts[i]),float(x)) for i,x in enumerate(ps) if i<len(ts)]
-                    diag[k]["history"]=len(history_data[k])
-                    diag[k]["last_msg_type"]="HISTORY"
-                    ticks_data[k].clear()
-                    for item in history_data[k][-LIVE_HISTORY:]:
-                        ticks_data[k].append(item)
-                    echo=msg.get("echo_req") or {}
-                    if echo.get("ticks_history"):
-                        history_symbol=str(echo["ticks_history"])
-                    if history_symbol:
-                        symbol=history_symbol
-                        DERIV_SYMBOLS[k]=symbol
-                    diag[k]["stage"]="WARMUP"
-                    await asyncio.to_thread(warmup,k)
-                    history_received=True
-            if not history_received:
-                raise RuntimeError("History response timeout")
-            diag[k]["stage"]="SUBSCRIBING"
-            await ws.send(json.dumps({
-                "ticks":symbol,
-                "subscribe":1,
-                "req_id":2000
-            }))
-            diag[k]["last_msg_type"]="SUBSCRIBE_REQUESTED"
-            while k in active:
-                raw=await ws.recv()
-                msg=json.loads(raw)
-                msg_type=msg.get("msg_type","")
-                if msg_type=="error" or "error" in msg:
-                    err=msg.get("error",{})
-                    message=str(err.get("message",err))
+                    diag[k]["last_error"]=f"tick parse: {e}"
+                    diag[k]["last_msg_type"]="TICK_PARSE_ERROR"
+                    continue
+
+                diag[k]["subscribed"]=1
+                diag[k]["stage"]="LIVE"
+                diag[k]["ticks"]+=1
+                diag[k]["last_tick"]=timestamp
+                diag[k]["last_msg_type"]="LIVE_TICK"
+                ticks_data[k].append((timestamp,price))
+
+                ps=[x[1] for x in ticks_data[k]]
+                if len(ps)<210:
+                    continue
+
+                await evaluate(k,timestamp)
+                try:
+                    f=features(ps)
+                except Exception as e:
                     diag[k]["errors"]+=1
-                    diag[k]["last_error"]=message
-                    diag[k]["last_msg_type"]="ERROR"
-                    diag[k]["stage"]="ERROR"
-                    logging.error("%s Deriv error: %s",k,message)
-                    raise RuntimeError(message)
-                tick_data = None
-                if msg_type=="tick" and msg.get("tick"):
-                    tick_data = msg["tick"]
-                elif msg_type=="history" and msg.get("tick"):
-                    tick_data = msg["tick"]
-                if tick_data:
-                    try:
-                        price=float(tick_data["quote"])
-                        timestamp=float(tick_data.get("epoch",time.time()))
-                    except Exception as e:
-                        diag[k]["errors"]+=1
-                        diag[k]["last_error"]=f"tick parse: {e}"
-                        diag[k]["last_msg_type"]="TICK_PARSE_ERROR"
-                        continue
-                    diag[k]["subscribed"]=1
-                    diag[k]["stage"]="LIVE"
-                    diag[k]["ticks"]+=1
-                    diag[k]["last_tick"]=timestamp
-                    diag[k]["last_msg_type"]="LIVE_TICK"
-                    ticks_data[k].append((timestamp,price))
-                    ps=[x[1] for x in ticks_data[k]]
-                    if len(ps)<210:
-                        continue
-                    await evaluate(k,timestamp)
-                    try:
-                        f=features(ps)
-                    except Exception as e:
-                        diag[k]["errors"]+=1
-                        diag[k]["last_error"]=str(e)
-                        diag[k]["last_msg_type"]="FEATURE_ERROR"
-                        continue
-                    if f is None: continue
-                    diag[k]["features"]+=1
-                    c,conf,probs=predict(k,f)
-                    last_probs[k]=probs; last_class[k]=c
-                    diag[k]["last_confidence"]=conf
-                    if c!=0: diag[k]["candidates"]+=1
-                    if not allowed(k,c,conf):
-                        continue
-                    direction="BUY" if c==1 else "SELL"
-                    pending[k].append({"time":timestamp,"price":price,"direction":direction,"features":f,"confidence":conf})
-                    last_signal[k]=time.time()
-                    diag[k]["signals"]+=1
-                    await send_signal(app,k,direction,conf,probs)
+                    diag[k]["last_error"]=str(e)
+                    diag[k]["last_msg_type"]="FEATURE_ERROR"
+                    continue
+                if f is None: continue
+
+                diag[k]["features"]+=1
+                c,conf,probs=predict(k,f)
+                last_probs[k]=probs; last_class[k]=c
+                diag[k]["last_confidence"]=conf
+                if c!=0: diag[k]["candidates"]+=1
+
+                if not allowed(k,c,conf):
+                    continue
+
+                direction="BUY" if c==1 else "SELL"
+                pending[k].append({"time":timestamp,"price":price,"direction":direction,"features":f,"confidence":conf})
+                last_signal[k]=time.time()
+                diag[k]["signals"]+=1
+                await send_signal(app,k,direction,conf,probs)
+
     except asyncio.CancelledError:
         diag[k]["connected"]=0
         diag[k]["subscribed"]=0
@@ -450,6 +414,7 @@ def allowed(k,c,conf):
         diag[k]["blocked_cooldown"]+=1;diag[k]["last_block_reason"]="COOLDOWN";return False
     return True
 
+
 async def start_ws(k,app):
     while k in active:
         try:
@@ -465,6 +430,7 @@ async def start_ws(k,app):
             logging.error("%s websocket: %s",k,e)
             if k in active:
                 await asyncio.sleep(5)
+
 
 def keep_alive():
     port=int(os.environ.get("PORT","10000"))
@@ -538,6 +504,8 @@ async def status(update,context):
               "━━━━━━━━━━━━━━━━━━")
         await update.message.reply_text(text)
     await update.message.reply_text("🟢 /status COMPLETE")
+
+
 
 async def symbols(update,context):
     chat_ids.add(update.effective_chat.id)
