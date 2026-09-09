@@ -32,8 +32,8 @@ async def deriv_ws(k,app):
             async with websockets.connect(uri,ping_interval=20,ping_timeout=20) as ws:
                 diag[k]["stage"]="HISTORY"
                 diag[k]["connected"]=1
-                # FIX V58.1 - count 5000 -> 1000 болгож end алдааг заслаа!
-                await ws.send(json.dumps({"ticks_history":k,"count":1000,"style":"ticks"}))
+                # FIX V58.2 - end тоогоор заавал өгөх ёстой!
+                await ws.send(json.dumps({"ticks_history":k,"count":1000,"end":int(time.time()),"style":"ticks"}))
                 async for raw in ws:
                     msg=json.loads(raw)
                     if "error" in msg: raise RuntimeError(msg["error"]["message"])
@@ -69,7 +69,7 @@ async def deriv_ws(k,app):
 def keep_alive():
     port=int(os.environ.get("PORT","10000"))
     class H(BaseHTTPRequestHandler):
-        def do_GET(self): self.send_response(200);self.end_headers();self.wfile.write(b"V58.1 LIVE FIXED 1000")
+        def do_GET(self): self.send_response(200);self.end_headers();self.wfile.write(b"V58.2 FIXED END INT")
         def log_message(self,*a): pass
     HTTPServer(("0.0.0.0",port),H).serve_forever()
 threading.Thread(target=keep_alive,daemon=True).start()
@@ -83,7 +83,7 @@ async def start(update,context):
         active.add(k)
         if k not in tasks or tasks[k].done():
             tasks[k]=asyncio.create_task(deriv_ws(k,context.application))
-    await update.message.reply_text("V58.1 LIVE FIXED - 1000 - 7 INDEX",reply_markup=buttons())
+    await update.message.reply_text("V58.2 FIXED END INT - 7 INDEX",reply_markup=buttons())
 
 async def button(update,context):
     q=update.callback_query;await q.answer();k=q.data
@@ -99,7 +99,7 @@ async def button(update,context):
 
 async def status(update,context):
     chat_ids.add(update.effective_chat.id)
-    await update.message.reply_text(f"ACTIVE {len(active)}/7 V58.1 FIXED 1000")
+    await update.message.reply_text(f"ACTIVE {len(active)}/7 V58.2 END INT")
     for k in INDICES:
         d=diag[k]
         await update.message.reply_text(f"{k} Stage {d['stage']} WS {'ON' if d['connected'] else 'OFF'} Sub {'YES' if d['subscribed'] else 'NO'} Live {d['ticks']} Hist {d['history']} Err {d['error']}")
