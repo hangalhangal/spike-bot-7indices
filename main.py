@@ -21,18 +21,6 @@ INDICES={
 
 # Deriv API symbol-ийг active_symbols-оос автоматаар олно.
 DERIV_SYMBOLS={k:None for k in INDICES}
-# Deriv WebSocket market-data identifiers for the 7 requested Boom/Crash indices.
-# These are used as a safe bootstrap when active_symbols is unavailable/empty.
-KNOWN_DERIV_SYMBOLS={
-    "BOOM1000":"BOOM1000",
-    "BOOM500":"BOOM500",
-    "BOOM600":"BOOM600",
-    "BOOM900":"BOOM900",
-    "CRASH1000":"CRASH1000",
-    "CRASH500":"CRASH500",
-    "CRASH900":"CRASH900",
-}
-DERIV_APP_ID=os.getenv("DERIV_APP_ID","1089")
 
 LIVE_HISTORY=500; WARMUP_HISTORY=5000
 EARLY_MIN_SECONDS=60; EARLY_MAX_SECONDS=120
@@ -60,7 +48,7 @@ for k in INDICES:
              "errors":0,"last_error":"","last_tick":0.0,"last_confidence":0.0,
              "connected":0,"history":0,"subscribed":0,"last_msg_type":"",
              "last_block_reason":"","telegram_sent":0,"telegram_errors":0,
-             "last_telegram_error":"","stage":"IDLE"}
+             "last_telegram_error":""}
 
 def save_memory():
     try:
@@ -185,6 +173,8 @@ def warmup(k):
         except Exception as e:
             diag[k]["errors"]+=1;diag[k]["last_error"]=str(e);f=None
         if f is not None:pools[y].append(f)
+    # Хамгийн чухал засвар: 0/1/2 ангиллыг тэнцвэртэйгээр сургана.
+    # Ингэснээр ховор spike-ийг NO SPIKE анги дарж устгахгүй.
     if not any(pools):return
     pairs=[]; n=max(len(x) for x in pools)
     for i in range(n):
@@ -248,128 +238,94 @@ async def send_signal(app,k,direction,conf,probs):
             diag[k]["last_telegram_error"]=str(e)
             logging.error("Telegram send: %s",e)
 
+KNOWN_DERIV_SYMBOLS={
+    "BOOM1000":"BOOM1000",
+    "BOOM500":"BOOM500",
+    "BOOM600":"BOOM600",
+    "BOOM900":"BOOM900",
+    "CRASH1000":"CRASH1000",
+    "CRASH500":"CRASH500",
+    "CRASH900":"CRASH900",
+}
 
 def _norm_symbol_text(value):
     return "".join(ch for ch in str(value).upper() if ch.isalnum())
 
 async def get_active_symbols(ws):
-    found={}
-    available=[]
-    try:
-        await ws.send(json.dumps({"active_symbols":"brief","req_id":9001}))
-        while True:
-            raw=await asyncio.wait_for(ws.recv(), timeout=12)
-            msg=json.loads(raw)
-            if msg.get("msg_type")=="error":
-                err=msg.get("error",{})
-                raise RuntimeError(err.get("message","active_symbols error"))
-            if msg.get("msg_type")!="active_symbols":
+    """Resolve the 7 Boom/Crash symbols from Deriv active_symbols.
+
+    The current Deriv API uses underlying_symbol / underlying_symbol_name.
+    We match by both the displayed name and the actual symbol identifier,
+    because display-name formatting can change (for example, with/without
+    the word 'Index'). If a required symbol is not present in the response,
+    use the stable Deriv symbol identifier as a fallback and let the tick
+    request itself report any real API-side invalid-symbol error.
+    """
+    await ws.send(json.dumps({"active_symbols":"brief","req_id":9001}))
+    while True:
+        raw=await ws.recv()
+        msg=json.loads(raw)
+        if msg.get("msg_type")=="error":
+            err=msg.get("error",{})
+            raise RuntimeError(err.get("message","active_symbols error"))
+        if msg.get("msg_type")!="active_symbols":
+            continue
+
+        found={}
+        available=[]
+        for item in msg.get("active_symbols",[]):
+            symbol=item.get("underlying_symbol") or item.get("symbol")
+            name=item.get("underlying_symbol_name") or item.get("display_name") or ""
+            if not symbol:
                 continue
-            items=msg.get("active_symbols") or []
-            for item in items:
-                symbol=item.get("underlying_symbol") or item.get("symbol")
-                name=item.get("underlying_symbol_name") or item.get("display_name") or ""
-                if not symbol:
-                    continue
-                symbol=str(symbol); name=str(name)
-                available.append((symbol,name))
-                sym_norm=_norm_symbol_text(symbol)
-                name_norm=_norm_symbol_text(name)
-                for key,info in INDICES.items():
-                    key_norm=_norm_symbol_text(key)
-                    full=_norm_symbol_text(info["name"])
-                    short=_norm_symbol_text(info["name"].replace("Index",""))
-                    if sym_norm==key_norm or name_norm in (full,short):
-                        found[key]=symbol
-            break
-    except Exception as e:
-        logging.warning("active_symbols unavailable: %s",e)
+            symbol=str(symbol)
+            name=str(name)
+            available.append((symbol,name))
+            sym_norm=_norm_symbol_text(symbol)
+            name_norm=_norm_symbol_text(name)
 
-    if not available:
-        for key,stable_symbol in KNOWN_DERIV_SYMBOLS.items():
-            if key not in found:
-                found[key]=stable_symbol
-                logging.warning("%s active_symbols unavailable; bootstrap=%s",key,stable_symbol)
+            for key,info in INDICES.items():
+                key_norm=_norm_symbol_text(key)
+                name_key_norm=_norm_symbol_text(info["name"].replace("Index",""))
+                if sym_norm==key_norm or name_norm==name_key_norm or name_norm==_norm_symbol_text(info["name"]):
+                    found[key]=symbol
 
-    missing=[k for k in INDICES if k not in found]
-    if missing:
-        preview=", ".join(f"{sym}={name}" for sym,name in available[:80])
-        raise RuntimeError("Active symbol not resolved: "+", ".join(missing)+" | Available: "+preview)
+        # IMPORTANT: do not invent or fallback to a hard-coded symbol.
+        # Only a symbol actually returned by Deriv active_symbols is accepted.
+        missing=[k for k in INDICES if not found.get(k)]
+        if missing:
+            preview=", ".join(f"{s}={n}" for s,n in available[:80])
+            raise RuntimeError("Active symbol not found: "+", ".join(missing)+" | Available: "+preview)
 
-    DERIV_SYMBOLS.update(found)
-    logging.info("DERIV SYMBOL MAP: %s",found)
-    return found
+        DERIV_SYMBOLS.update(found)
+        logging.info("DERIV SYMBOL MAP: %s",found)
+        return found
 
 async def deriv_ws(k,app):
-    diag[k]["stage"]="CONNECTING"
-    uri=f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    uri="wss://ws.binaryws.com/websockets/v3?app_id={}".format(os.getenv("DERIV_APP_ID","1089"))
     diag[k]["last_error"]=""
     try:
-        # === CONNECTION 1: HISTORY ===
         async with websockets.connect(uri,ping_interval=20,ping_timeout=20,close_timeout=10) as ws:
             diag[k]["connected"]=1
-            diag[k]["stage"]="CONNECTED"
             diag[k]["last_msg_type"]="CONNECTED"
-            logging.info("%s CONNECTED (HISTORY)",k)
+            logging.info("%s CONNECTED",k)
 
-            symbol = KNOWN_DERIV_SYMBOLS[k]
-            DERIV_SYMBOLS[k] = symbol
-            logging.info(f"{k} DIRECT SYMBOL: {symbol}")
-            diag[k]["stage"]="SYMBOL_RESOLVED"
+            # IMPORTANT: never hard-code BOOM1000/CRASH1000 etc.
+            # Resolve all 7 from Deriv's active_symbols response first.
+            symbols=await get_active_symbols(ws)
+            symbol=symbols[k]
+            diag[k]["last_msg_type"]="SYMBOL_RESOLVED"
 
-            diag[k]["stage"]="HISTORY_REQUESTING"
             await ws.send(json.dumps({
                 "ticks_history":symbol,
-                "adjust_start_time":1,
                 "count":WARMUP_HISTORY,
                 "end":"latest",
                 "style":"ticks",
+                "subscribe":0,
                 "req_id":1000
             }))
-            diag[k]["stage"]="HISTORY_REQUESTED"
+            diag[k]["last_msg_type"]="HISTORY_REQUESTED"
 
-            history_received=False
-            history_symbol=symbol
-            while k in active and not history_received:
-                raw=await asyncio.wait_for(ws.recv(), timeout=20)
-                msg=json.loads(raw)
-                msg_type=msg.get("msg_type","")
-
-                if msg_type=="error" or "error" in msg:
-                    err=msg.get("error",{})
-                    message=str(err.get("message",err))
-                    diag[k]["errors"]+=1
-                    diag[k]["last_error"]=message
-                    diag[k]["stage"]="ERROR"
-                    raise RuntimeError(message)
-
-                if msg_type=="history" and msg.get("history") is not None:
-                    h=msg["history"]
-                    ps=h.get("prices",[]); ts=h.get("times",[])
-                    history_data[k]=[(float(ts[i]),float(x)) for i,x in enumerate(ps) if i<len(ts)]
-                    diag[k]["history"]=len(history_data[k])
-                    diag[k]["last_msg_type"]="HISTORY"
-                    ticks_data[k].clear()
-                    for item in history_data[k][-LIVE_HISTORY:]:
-                        ticks_data[k].append(item)
-                    echo=msg.get("echo_req") or {}
-                    if echo.get("ticks_history"):
-                        history_symbol=str(echo["ticks_history"])
-                    if history_symbol:
-                        symbol=history_symbol
-                        DERIV_SYMBOLS[k]=symbol
-                    diag[k]["stage"]="WARMUP"
-                    await asyncio.to_thread(warmup,k)
-                    history_received=True
-
-            if not history_received:
-                raise RuntimeError("History response timeout")
-
-        # === CONNECTION 2: LIVE ===
-        async with websockets.connect(uri,ping_interval=20,ping_timeout=20,close_timeout=10) as ws:
-            diag[k]["connected"]=1
-            diag[k]["stage"]="SUBSCRIBING"
-            logging.info("%s CONNECTED (LIVE) %s",k,symbol)
             await ws.send(json.dumps({
                 "ticks":symbol,
                 "subscribe":1,
@@ -388,25 +344,33 @@ async def deriv_ws(k,app):
                     diag[k]["errors"]+=1
                     diag[k]["last_error"]=message
                     diag[k]["last_msg_type"]="ERROR"
-                    diag[k]["stage"]="ERROR"
                     logging.error("%s Deriv error: %s",k,message)
-                    raise RuntimeError(message)
+                    continue
 
-                tick_data = None
+                if msg_type=="history" and msg.get("history"):
+                    h=msg["history"]
+                    ps=h.get("prices",[]); ts=h.get("times",[])
+                    history_data[k]=[(float(ts[i]),float(x)) for i,x in enumerate(ps) if i<len(ts)]
+                    diag[k]["history"]=len(history_data[k])
+                    diag[k]["last_msg_type"]="HISTORY"
+                    ticks_data[k].clear()
+                    for item in history_data[k][-LIVE_HISTORY:]:
+                        ticks_data[k].append(item)
+                    await asyncio.to_thread(warmup,k)
+                    continue
+
                 if msg_type=="tick" and msg.get("tick"):
-                    tick_data = msg["tick"]
-
-                if tick_data:
+                    t=msg["tick"]
                     try:
-                        price=float(tick_data["quote"])
-                        timestamp=float(tick_data.get("epoch",time.time()))
+                        price=float(t["quote"])
+                        timestamp=float(t.get("epoch",time.time()))
                     except Exception as e:
                         diag[k]["errors"]+=1
                         diag[k]["last_error"]=f"tick parse: {e}"
+                        diag[k]["last_msg_type"]="TICK_PARSE_ERROR"
                         continue
 
                     diag[k]["subscribed"]=1
-                    diag[k]["stage"]="LIVE"
                     diag[k]["ticks"]+=1
                     diag[k]["last_tick"]=timestamp
                     diag[k]["last_msg_type"]="LIVE_TICK"
@@ -422,6 +386,7 @@ async def deriv_ws(k,app):
                     except Exception as e:
                         diag[k]["errors"]+=1
                         diag[k]["last_error"]=str(e)
+                        diag[k]["last_msg_type"]="FEATURE_ERROR"
                         continue
                     if f is None: continue
 
@@ -443,7 +408,6 @@ async def deriv_ws(k,app):
     except asyncio.CancelledError:
         diag[k]["connected"]=0
         diag[k]["subscribed"]=0
-        diag[k]["stage"]="STOPPED"
         diag[k]["last_msg_type"]="STOPPED"
         raise
     except Exception as e:
@@ -451,14 +415,12 @@ async def deriv_ws(k,app):
         diag[k]["subscribed"]=0
         diag[k]["errors"]+=1
         diag[k]["last_error"]=f"{type(e).__name__}: {e}"
-        diag[k]["stage"]="ERROR"
         diag[k]["last_msg_type"]="WS_EXCEPTION"
         logging.error("%s websocket exception: %s",k,e)
         raise
     finally:
         diag[k]["connected"]=0
         diag[k]["subscribed"]=0
-
 
 def allowed(k,c,conf):
     diag[k]["last_block_reason"]=""
@@ -481,7 +443,6 @@ async def start_ws(k,app):
             return
         except Exception as e:
             diag[k]["last_error"]=f"{type(e).__name__}: {e}"
-            diag[k]["stage"]="RECONNECTING"
             diag[k]["last_msg_type"]="RECONNECTING"
             diag[k]["connected"]=0
             diag[k]["subscribed"]=0
@@ -534,7 +495,6 @@ async def status(update,context):
         symbol=DERIV_SYMBOLS.get(k) or "NOT RESOLVED"
         text=(f"{'🟢' if k in active else '⚪'} {info['name']}\n━━━━━━━━━━━━━━━━━━\n"
               f"🔑 API Symbol: {symbol}\n"
-              f"🧭 Stage: {diag[k].get('stage','IDLE')}\n"
               f"📡 WebSocket: {'CONNECTED ✅' if diag[k]['connected'] else 'OFFLINE ❌'}\n"
               f"📚 History: {diag[k]['history']}\n"
               f"📥 Subscribed: {'YES ✅' if diag[k]['subscribed'] else 'NO ❌'}\n"
@@ -583,16 +543,7 @@ async def test(update,context):
     await update.message.reply_text("🧪 AI MANIAC V5 FIX TEST\n\nTelegram: OK ✅\n7 Index engine: OK ✅\nHistorical warm-up: ON ✅\nBalanced training: ON ✅\nOnline learning: ON ✅\nPersistent memory: ON ✅\nDiagnostic 40% filter: ON ✅\nAuto /start activation: ON ✅\n\n⚠️ TEST MESSAGE ONLY")
 
 load_memory()
-async def auto_start(application):
-    logging.info("AUTO START: activating 7 indices...")
-    for k in INDICES:
-        active.add(k)
-        diag[k]["stage"]="STARTING"
-        if k not in tasks or tasks[k].done():
-            tasks[k]=asyncio.create_task(start_ws(k,application))
-    logging.info("AUTO START: 7 indices activated")
-
-app=ApplicationBuilder().token(TOKEN).post_init(auto_start).build()
+app=ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start",start))
 app.add_handler(CommandHandler("status",status))
 app.add_handler(CommandHandler("symbols",symbols))
