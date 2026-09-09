@@ -19,10 +19,7 @@ INDICES={
 "CRASH500":{"name":"Crash 500 Index","type":"CRASH"},
 "CRASH900":{"name":"Crash 900 Index","type":"CRASH"}}
 
-# Deriv API symbol-ийг active_symbols-оос автоматаар олно.
-DERIV_SYMBOLS={k:KNOWN_DERIV_SYMBOLS.get(k, k) for k in INDICES}
-# Deriv WebSocket market-data identifiers for the 7 requested Boom/Crash indices.
-# These are used as a safe bootstrap when active_symbols is unavailable/empty.
+# Deriv symbols - FIXED ORDER: KNOWN first!
 KNOWN_DERIV_SYMBOLS={
     "BOOM1000":"BOOM1000",
     "BOOM500":"BOOM500",
@@ -32,6 +29,12 @@ KNOWN_DERIV_SYMBOLS={
     "CRASH500":"CRASH500",
     "CRASH900":"CRASH900",
 }
+DERIV_SYMBOLS={k:KNOWN_DERIV_SYMBOLS.get(k, k) for k in INDICES}
+
+
+# Deriv API symbol-ийг active_symbols-оос автоматаар олно.
+# Deriv WebSocket market-data identifiers for the 7 requested Boom/Crash indices.
+# These are used as a safe bootstrap when active_symbols is unavailable/empty.
 DERIV_APP_ID=os.getenv("DERIV_APP_ID","1089")
 
 LIVE_HISTORY=500; WARMUP_HISTORY=5000
