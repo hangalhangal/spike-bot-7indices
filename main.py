@@ -1419,18 +1419,97 @@ def calculate_spike_analysis(symbol):
 
         compression_ratio = 1.0
 
-    recent_move = abs(
-        prices[-1]
-        - prices[-11]
+    # ========================================================
+    # RANGE EXPANSION NORMALIZATION FIX
+    # Compare the latest 10-tick movement with previous
+    # 10-tick movement blocks.
+    # This avoids comparing a 10-tick move against a
+    # 1-tick ATR.
+    # ========================================================
+
+    block_size = 10
+
+    recent_changes = []
+
+    for i in range(
+        len(prices) - block_size,
+        len(prices)
+    ):
+
+        recent_changes.append(
+            abs(
+                prices[i]
+                - prices[i - 1]
+            )
+        )
+
+    recent_range = sum(
+        recent_changes
     )
 
-    expansion_ratio = (
-        recent_move
-        / max(
-            atr,
-            0.000000001
-        )
+    baseline_ranges = []
+
+    baseline_start = max(
+        1,
+        len(prices) - 40
     )
+
+    baseline_end = (
+        len(prices) - block_size
+    )
+
+    for block_start in range(
+        baseline_start,
+        baseline_end,
+        block_size
+    ):
+
+        block_end = min(
+            block_start + block_size,
+            baseline_end
+        )
+
+        block_changes = []
+
+        for i in range(
+            block_start,
+            block_end
+        ):
+
+            block_changes.append(
+                abs(
+                    prices[i]
+                    - prices[i - 1]
+                )
+            )
+
+        if block_changes:
+
+            baseline_ranges.append(
+                sum(block_changes)
+            )
+
+    if baseline_ranges:
+
+        baseline_range = (
+            sum(baseline_ranges)
+            / len(baseline_ranges)
+        )
+
+    else:
+
+        baseline_range = 0.0
+
+    if baseline_range > 0:
+
+        expansion_ratio = (
+            recent_range
+            / baseline_range
+        )
+
+    else:
+
+        expansion_ratio = 1.0
 
     symbol_is_boom = symbol.startswith(
         "BOOM"
