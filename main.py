@@ -1,16 +1,14 @@
 import os
 import json
-import math
 import time
+import math
 import asyncio
-import threading
 import logging
-from collections import deque
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from collections import deque
 
-import numpy as np
 import websockets
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -20,7 +18,9 @@ from telegram.ext import (
 )
 
 # ============================================================
-# LOGGING
+# AI MANIAC V4
+# ONLY 7 BOOM / CRASH INDICES
+# TELEGRAM SIGNAL ONLY
 # ============================================================
 
 logging.basicConfig(
@@ -28,1967 +28,1204 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-# ============================================================
-# TELEGRAM
-# IMPORTANT: TOKEN / TELEGRAM DELIVERY PATH NOT CHANGED
-# ============================================================
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
-# ============================================================
-# ONLY THESE 7 INDICES
-# ============================================================
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN environment variable is missing")
 
 INDICES = {
-    "BOOM1000": {
-        "name": "Boom 1000 Index",
-        "symbol": "BOOM1000",
-        "type": "BOOM"
-    },
-    "CRASH1000": {
-        "name": "Crash 1000 Index",
-        "symbol": "CRASH1000",
-        "type": "CRASH"
-    },
-    "BOOM500": {
-        "name": "Boom 500 Index",
-        "symbol": "BOOM500",
-        "type": "BOOM"
-    },
-    "CRASH500": {
-        "name": "Crash 500 Index",
-        "symbol": "CRASH500",
-        "type": "CRASH"
-    },
-    "BOOM600": {
-        "name": "Boom 600 Index",
-        "symbol": "BOOM600",
-        "type": "BOOM"
-    },
-    "CRASH900": {
-        "name": "Crash 900 Index",
-        "symbol": "CRASH900",
-        "type": "CRASH"
-    },
-    "BOOM900": {
-        "name": "Boom 900 Index",
-        "symbol": "BOOM900",
-        "type": "BOOM"
-    },
+    "BOOM1000": {"name": "Boom 1000 Index", "symbol": "BOOM1000", "type": "BOOM"},
+    "BOOM500": {"name": "Boom 500 Index", "symbol": "BOOM500", "type": "BOOM"},
+    "BOOM600": {"name": "Boom 600 Index", "symbol": "BOOM600", "type": "BOOM"},
+    "BOOM900": {"name": "Boom 900 Index", "symbol": "BOOM900", "type": "BOOM"},
+    "CRASH1000": {"name": "Crash 1000 Index", "symbol": "CRASH1000", "type": "CRASH"},
+    "CRASH500": {"name": "Crash 500 Index", "symbol": "CRASH500", "type": "CRASH"},
+    "CRASH900": {"name": "Crash 900 Index", "symbol": "CRASH900", "type": "CRASH"},
 }
 
-# ============================================================
-# SETTINGS
-# ============================================================
+LIVE_HISTORY = 500
+WARMUP_HISTORY = 5000
 
-HISTORY_COUNT = 5000
-MAX_TICKS = 10000
+EARLY_MIN_SECONDS = 60
+EARLY_MAX_SECONDS = 120
+SPIKE_THRESHOLD = 0.10
 
-# Prediction window:
-# Signal should happen BEFORE expected spike.
-PREDICT_MIN_SECONDS = 60
-PREDICT_MAX_SECONDS = 120
+SIGNAL_CONFIDENCE = 0.78
+MIN_SIGNAL_CONFIDENCE = 0.75
+MAX_SIGNAL_CONFIDENCE = 0.80
 
-# Minimum confidence required.
-# Quality > quantity.
-MIN_CONFIDENCE = 0.78
+COOLDOWN_SECONDS = 120
 
-# Model confidence margin.
-MIN_MARGIN = 0.12
+LEARNING_RATE = 0.025
+L2 = 0.0003
 
-# Do not spam same market.
-SIGNAL_COOLDOWN = 120
+MIN_TRAINING_SAMPLES = 300
+MIN_RECENT_RESULTS = 40
+RECENT_RESULTS = 100
 
-# After a signal, evaluate it after 60-120 sec.
-EVALUATION_DELAY = 125
+MEMORY_FILE = "ai_memory_v4.json"
 
-# Minimum number of samples before trusting learned model.
-MIN_TRAINING_SAMPLES = 150
-
-# Persistent brain.
-BRAIN_FILE = "ai_brain.json"
-
-# ============================================================
-# GLOBAL STATE
-# ============================================================
+FEATURE_COUNT = 33
+CLASS_COUNT = 3
 
 active = set()
-
-# Each item:
-# {"price": float, "time": unix_timestamp}
-ticks_data = {
-    k: deque(maxlen=MAX_TICKS)
-    for k in INDICES
-}
-
 chat_ids = set()
 
-last_signal_time = {
-    k: 0.0
-    for k in INDICES
+ticks_data = {
+    k: deque(maxlen=LIVE_HISTORY) for k in INDICES
 }
 
-pending_predictions = {
-    k: []
-    for k in INDICES
+history_data = {
+    k: [] for k in INDICES
 }
 
-learn_stats = {
-    k: {
+models = {}
+learn_stats = {}
+recent_results = {}
+pending_predictions = {}
+last_signal_time = {}
+ws_tasks = {}
+history_trained = set()
+diagnostics = {}
+
+for key in INDICES:
+    models[key] = {
+        "weights": [[0.0] * FEATURE_COUNT for _ in range(CLASS_COUNT)],
+        "bias": [0.0] * CLASS_COUNT,
+        "samples": 0,
+    }
+
+    learn_stats[key] = {
         "ok": 0,
         "fail": 0,
         "training": 0,
-        "signals": 0,
+        "no_spike": 0,
+        "early": 0
     }
-    for k in INDICES
-}
 
-# ============================================================
-# FEATURE NAMES
-# ============================================================
+    recent_results[key] = deque(maxlen=RECENT_RESULTS)
+    pending_predictions[key] = []
+    last_signal_time[key] = 0.0
 
-FEATURE_NAMES = [
-    "ret_5",
-    "ret_10",
-    "ret_20",
-    "ret_40",
-    "ret_80",
-
-    "ema_fast_gap",
-    "ema_slow_gap",
-
-    "rsi",
-    "macd",
-    "macd_signal",
-    "macd_hist",
-
-    "atr_norm",
-    "volatility",
-
-    "bb_position",
-    "bb_width",
-
-    "momentum",
-
-    "trend_strength",
-    "adx",
-
-    "structure",
-    "bos",
-    "choch",
-
-    "liquidity_sweep",
-    "fvg",
-
-    "order_block",
-
-    "amd_accumulation",
-    "amd_manipulation",
-    "amd_distribution",
-
-    "spike_distance",
-    "spike_frequency",
-
-    "buy_pressure",
-    "sell_pressure",
-]
+    diagnostics[key] = {
+        "ticks": 0,
+        "features": 0,
+        "candidates": 0,
+        "signals": 0,
+        "blocked_confidence": 0,
+        "blocked_direction": 0,
+        "blocked_cooldown": 0,
+        "blocked_training": 0,
+        "errors": 0,
+        "last_error": "",
+        "last_tick": 0.0,
+        "last_confidence": 0.0
+    }
 
 
 # ============================================================
-# BRAIN
+# MEMORY
 # ============================================================
 
-class AIBrain:
+def save_memory():
+    try:
+        data = {
+            "models": models,
+            "stats": learn_stats,
+            "recent": {
+                k: list(v) for k, v in recent_results.items()
+            },
+        }
 
-    def __init__(self, key):
+        tmp = MEMORY_FILE + ".tmp"
 
-        self.key = key
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
 
-        self.n = len(FEATURE_NAMES)
+        os.replace(tmp, MEMORY_FILE)
 
-        self.weights = np.zeros(self.n, dtype=float)
-        self.bias = 0.0
+    except Exception as e:
+        logging.error("Memory save error: %s", e)
 
-        self.samples = 0
-        self.correct = 0
-        self.wrong = 0
 
-        self.learning_rate = 0.025
-        self.l2 = 0.0005
+def load_memory():
+    if not os.path.exists(MEMORY_FILE):
+        logging.info("No previous AI memory. Starting fresh.")
+        return
 
-        self.recent_errors = deque(maxlen=100)
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-        self.load()
+        for key in INDICES:
 
-    # --------------------------------------------------------
-    # SAVE
-    # --------------------------------------------------------
+            if key in data.get("models", {}):
+                m = data["models"][key]
 
-    def save(self):
+                if (
+                    len(m.get("weights", [])) == CLASS_COUNT
+                    and all(
+                        len(row) == FEATURE_COUNT
+                        for row in m["weights"]
+                    )
+                    and len(m.get("bias", [])) == CLASS_COUNT
+                ):
+                    models[key] = m
 
-        try:
+            if key in data.get("stats", {}):
+                learn_stats[key].update(
+                    data["stats"][key]
+                )
 
-            all_brains = {}
+            if key in data.get("recent", {}):
+                recent_results[key] = deque(
+                    data["recent"][key],
+                    maxlen=RECENT_RESULTS
+                )
 
-            if os.path.exists(BRAIN_FILE):
-                try:
-                    with open(BRAIN_FILE, "r") as f:
-                        all_brains = json.load(f)
-                except Exception:
-                    all_brains = {}
+        logging.info("AI memory loaded.")
 
-            all_brains[self.key] = {
-                "weights": self.weights.tolist(),
-                "bias": float(self.bias),
-                "samples": int(self.samples),
-                "correct": int(self.correct),
-                "wrong": int(self.wrong),
-                "learning_rate": self.learning_rate,
-            }
+    except Exception as e:
+        logging.error("Memory load error: %s", e)
 
-            tmp = BRAIN_FILE + ".tmp"
 
-            with open(tmp, "w") as f:
-                json.dump(all_brains, f)
+# ============================================================
+# MODEL
+# ============================================================
 
-            os.replace(tmp, BRAIN_FILE)
+def softmax(scores):
 
-        except Exception as e:
-            logging.error(f"{self.key} brain save error: {e}")
+    m = max(scores)
 
-    # --------------------------------------------------------
-    # LOAD
-    # --------------------------------------------------------
+    exps = [
+        math.exp(
+            max(-50.0, min(50.0, x - m))
+        )
+        for x in scores
+    ]
 
-    def load(self):
+    total = sum(exps)
 
-        try:
+    if total <= 0:
+        return [1.0 / CLASS_COUNT] * CLASS_COUNT
 
-            if not os.path.exists(BRAIN_FILE):
-                return
+    return [
+        x / total
+        for x in exps
+    ]
 
-            with open(BRAIN_FILE, "r") as f:
-                data = json.load(f)
 
-            item = data.get(self.key)
+def dot(a, b):
+    return sum(
+        x * y
+        for x, y in zip(a, b)
+    )
 
-            if not item:
-                return
 
-            weights = item.get("weights", [])
+def predict(key, features):
 
-            if len(weights) == self.n:
-                self.weights = np.array(weights, dtype=float)
+    model = models[key]
 
-            self.bias = float(item.get("bias", 0.0))
-            self.samples = int(item.get("samples", 0))
-            self.correct = int(item.get("correct", 0))
-            self.wrong = int(item.get("wrong", 0))
+    scores = [
+        dot(
+            model["weights"][c],
+            features
+        ) + model["bias"][c]
+        for c in range(CLASS_COUNT)
+    ]
 
-            logging.info(
-                f"{self.key} AI brain loaded: "
-                f"samples={self.samples}"
+    probs = softmax(scores)
+
+    best = max(
+        range(CLASS_COUNT),
+        key=lambda i: probs[i]
+    )
+
+    return best, probs[best], probs
+
+
+def train_model(key, features, actual_class):
+
+    model = models[key]
+
+    scores = [
+        dot(
+            model["weights"][c],
+            features
+        ) + model["bias"][c]
+        for c in range(CLASS_COUNT)
+    ]
+
+    probs = softmax(scores)
+
+    for c in range(CLASS_COUNT):
+
+        target = 1.0 if c == actual_class else 0.0
+
+        error = target - probs[c]
+
+        for i in range(FEATURE_COUNT):
+
+            gradient = (
+                error * features[i]
+                - L2 * model["weights"][c][i]
             )
 
-        except Exception as e:
-            logging.error(f"{self.key} brain load error: {e}")
+            model["weights"][c][i] += (
+                LEARNING_RATE * gradient
+            )
 
-    # --------------------------------------------------------
-    # SIGMOID
-    # --------------------------------------------------------
+        model["bias"][c] += (
+            LEARNING_RATE * error
+        )
 
-    def sigmoid(self, x):
+    model["samples"] += 1
+    learn_stats[key]["training"] += 1
 
-        x = np.clip(x, -20, 20)
 
-        return 1.0 / (1.0 + np.exp(-x))
+# ============================================================
+# FEATURE ENGINE
+# ============================================================
 
-    # --------------------------------------------------------
-    # PREDICT
-    # --------------------------------------------------------
+def calculate_features(prices):
 
-    def predict(self, features):
+    if len(prices) < 210:
+        return None
 
-        x = np.asarray(features, dtype=float)
+    p = [
+        float(x)
+        for x in prices
+    ]
 
-        if len(x) != self.n:
-            return 0.5
+    cur = p[-1]
 
-        score = float(np.dot(self.weights, x) + self.bias)
+    if cur == 0:
+        return None
 
-        return float(self.sigmoid(score))
+    def ret(n):
 
-    # --------------------------------------------------------
-    # ONLINE LEARNING
-    #
-    # target:
-    # 1 = expected spike occurred
-    # 0 = did not occur
-    # --------------------------------------------------------
+        old = p[-1-n]
 
-    def learn(self, features, target):
+        if old:
+            return (
+                (cur - old)
+                / old
+                * 100.0
+            )
 
-        x = np.asarray(features, dtype=float)
+        return 0.0
 
-        prediction = self.predict(x)
+    (
+        r1,
+        r3,
+        r5,
+        r10,
+        r20,
+        r50,
+        r100,
+        r200
+    ) = [
+        ret(n)
+        for n in (
+            1,
+            3,
+            5,
+            10,
+            20,
+            50,
+            100,
+            200
+        )
+    ]
 
-        error = float(target - prediction)
+    momentum = (
+        r5 * 0.30
+        + r10 * 0.25
+        + r20 * 0.20
+        + r50 * 0.15
+        + r100 * 0.10
+    )
 
-        self.weights += (
-            self.learning_rate *
+    acceleration = r5 - r20
+
+    recent = p[-50:]
+
+    ch = [
+        abs(
             (
-                error * x
-                - self.l2 * self.weights
+                recent[i]
+                - recent[i-1]
+            )
+            / recent[i-1]
+            * 100
+        )
+        for i in range(
+            1,
+            len(recent)
+        )
+        if recent[i-1] != 0
+    ]
+
+    volatility = (
+        sum(ch) / len(ch)
+        if ch
+        else 0.0
+    )
+
+    up = 0
+    down = 0
+
+    for i in range(
+        1,
+        min(30, len(p)-1)
+    ):
+
+        if p[-i] > p[-i-1]:
+            up += 1
+
+        elif p[-i] < p[-i-1]:
+            down += 1
+
+    pressure = (
+        (up - down)
+        / 30.0
+    )
+
+    gains = []
+    losses = []
+
+    for i in range(
+        max(1, len(p)-15),
+        len(p)
+    ):
+
+        d = p[i] - p[i-1]
+
+        gains.append(
+            max(d, 0)
+        )
+
+        losses.append(
+            max(-d, 0)
+        )
+
+    ag = (
+        sum(gains) / len(gains)
+        if gains
+        else 0
+    )
+
+    al = (
+        sum(losses) / len(losses)
+        if losses
+        else 0
+    )
+
+    if ag > 0 and al == 0:
+        rsi = 100
+
+    elif al == 0:
+        rsi = 50
+
+    else:
+        rsi = (
+            100
+            - (
+                100
+                / (1 + ag / al)
             )
         )
 
-        self.bias += self.learning_rate * error
-
-        self.samples += 1
-
-        if target == 1:
-            self.correct += 1
-        else:
-            self.wrong += 1
-
-        self.recent_errors.append(abs(error))
-
-        # Adaptive learning:
-        # if recent error is high -> learn a little faster.
-        if len(self.recent_errors) >= 20:
-
-            avg_error = np.mean(self.recent_errors)
-
-            if avg_error > 0.40:
-                self.learning_rate = min(
-                    0.06,
-                    self.learning_rate * 1.02
-                )
-
-            elif avg_error < 0.20:
-                self.learning_rate = max(
-                    0.008,
-                    self.learning_rate * 0.995
-                )
-
-        if self.samples % 10 == 0:
-            self.save()
-
-
-brains = {
-    k: AIBrain(k)
-    for k in INDICES
-}
-
-
-# ============================================================
-# KEEP ALIVE
-# ============================================================
-
-def keep_alive():
-
-    port = int(os.environ.get("PORT", 10000))
-
-    class Handler(BaseHTTPRequestHandler):
-
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(
-                b"AI PREDICTIVE SPIKE BOT LIVE"
-            )
-
-        def log_message(self, *args):
-            return
-
-    httpd = HTTPServer(
-        ("0.0.0.0", port),
-        Handler
-    )
-
-    httpd.serve_forever()
-
-
-threading.Thread(
-    target=keep_alive,
-    daemon=True
-).start()
-
-
-# ============================================================
-# BASIC MATH
-# ============================================================
-
-def safe_mean(values):
-
-    if len(values) == 0:
-        return 0.0
-
-    return float(np.mean(values))
-
-
-def safe_std(values):
-
-    if len(values) < 2:
-        return 0.0
-
-    return float(np.std(values))
-
-
-def ema(values, period):
-
-    if len(values) == 0:
-        return 0.0
-
-    alpha = 2.0 / (period + 1.0)
-
-    result = float(values[0])
-
-    for value in values[1:]:
-        result = alpha * float(value) + (1 - alpha) * result
-
-    return result
-
-
-def rsi(values, period=14):
-
-    if len(values) < period + 1:
-        return 50.0
-
-    arr = np.asarray(values, dtype=float)
-
-    diff = np.diff(arr)
-
-    gains = np.maximum(diff, 0)
-    losses = np.maximum(-diff, 0)
-
-    avg_gain = np.mean(gains[-period:])
-    avg_loss = np.mean(losses[-period:])
-
-    if avg_loss == 0:
-        return 100.0 if avg_gain > 0 else 50.0
-
-    rs = avg_gain / avg_loss
-
-    return 100.0 - (100.0 / (1.0 + rs))
-
-
-def atr(values, period=14):
-
-    if len(values) < period + 1:
-        return 0.0
-
-    arr = np.asarray(values, dtype=float)
-
-    tr = np.abs(np.diff(arr))
-
-    return float(np.mean(tr[-period:]))
-
-
-def normalize(value, scale):
-
-    if scale == 0:
-        return 0.0
-
-    return float(np.clip(value / scale, -5.0, 5.0))
-
-
-# ============================================================
-# MARKET FEATURES
-# ============================================================
-
-def calculate_features(key):
-
-    data = ticks_data[key]
-
-    if len(data) < 250:
-        return None
-
-    prices = np.array(
-        [x["price"] for x in data],
-        dtype=float
-    )
-
-    current = prices[-1]
-
-    if current <= 0:
-        return None
-
-    # --------------------------------------------------------
-    # RETURNS
-    # --------------------------------------------------------
-
-    def ret(period):
-
-        if len(prices) <= period:
-            return 0.0
+    rsi_norm = (
+        rsi - 50
+    ) / 50
+
+    def mean(n):
 
         return (
-            (prices[-1] - prices[-1-period])
-            / prices[-1-period]
+            sum(p[-n:])
+            / min(n, len(p))
         )
 
-    ret5 = ret(5)
-    ret10 = ret(10)
-    ret20 = ret(20)
-    ret40 = ret(40)
-    ret80 = ret(80)
+    ema12 = mean(12)
+    ema26 = mean(26)
 
-    # --------------------------------------------------------
-    # EMA
-    # --------------------------------------------------------
-
-    ema_fast = ema(prices[-60:], 9)
-    ema_slow = ema(prices[-120:], 21)
-
-    ema_fast_gap = normalize(
-        current - ema_fast,
-        max(atr(prices[-100:]), 1e-12)
+    macd = (
+        (ema12 - ema26)
+        / cur
+        * 100
     )
 
-    ema_slow_gap = normalize(
-        current - ema_slow,
-        max(atr(prices[-150:]), 1e-12)
+    signal = mean(9)
+
+    macd_signal = (
+        (ema12 - signal)
+        / cur
+        * 100
     )
 
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
-    rsi_value = rsi(prices, 14)
-
-    rsi_norm = (rsi_value - 50.0) / 50.0
-
-    # --------------------------------------------------------
-    # MACD
-    # --------------------------------------------------------
-
-    ema12 = ema(prices[-100:], 12)
-    ema26 = ema(prices[-150:], 26)
-
-    macd_value = ema12 - ema26
-
-    macd_series = []
-
-    start = max(0, len(prices) - 100)
-
-    temp = prices[start:]
-
-    for i in range(30, len(temp) + 1):
-
-        part = temp[:i]
-
-        e12 = ema(part, 12)
-        e26 = ema(part, 26)
-
-        macd_series.append(e12 - e26)
-
-    if len(macd_series) >= 9:
-        macd_signal = ema(
-            np.array(macd_series),
-            9
+    tr = [
+        abs(
+            p[i] - p[i-1]
         )
-    else:
-        macd_signal = macd_value
+        for i in range(
+            max(1, len(p)-30),
+            len(p)
+        )
+    ]
 
-    macd_hist = macd_value - macd_signal
-
-    scale_atr = max(
-        atr(prices[-100:]),
-        current * 1e-8
+    atr = (
+        sum(tr) / len(tr)
+        if tr
+        else 0
     )
 
-    macd_norm = normalize(
-        macd_value,
-        scale_atr
+    atr_pct = (
+        atr / cur * 100
+        if cur
+        else 0
     )
 
-    macd_signal_norm = normalize(
-        macd_signal,
-        scale_atr
+    atr_move = (
+        (p[-1] - p[-2]) / atr
+        if atr
+        else 0
     )
 
-    macd_hist_norm = normalize(
-        macd_hist,
-        scale_atr
+    w = p[-20:]
+
+    m = sum(w) / len(w)
+
+    sd = (
+        sum(
+            (x - m) ** 2
+            for x in w
+        )
+        / len(w)
+    ) ** 0.5
+
+    bb = (
+        (cur - m)
+        / (2 * sd)
+        if sd
+        else 0
     )
 
-    # --------------------------------------------------------
-    # ATR
-    # --------------------------------------------------------
+    sma20 = mean(20)
+    sma50 = mean(50)
+    sma100 = mean(100)
 
-    atr_value = atr(prices[-100:], 14)
-
-    atr_norm = normalize(
-        atr_value,
-        current
+    trend = (
+        (
+            (sma20 - sma50)
+            / sma50
+            * 100
+            if sma50
+            else 0
+        ) * 0.5
+        +
+        (
+            (sma50 - sma100)
+            / sma100
+            * 100
+            if sma100
+            else 0
+        ) * 0.3
+        +
+        (
+            (cur - sma20)
+            / sma20
+            * 100
+            if sma20
+            else 0
+        ) * 0.2
     )
 
-    # --------------------------------------------------------
-    # VOLATILITY
-    # --------------------------------------------------------
+    plus = 0
+    minus = 0
 
-    returns = np.diff(prices[-100:]) / prices[-101:-1]
+    for i in range(
+        max(1, len(p)-20),
+        len(p)
+    ):
 
-    volatility = safe_std(returns)
+        d = p[i] - p[i-1]
 
-    volatility_norm = normalize(
-        volatility,
+        if d > 0:
+            plus += d
+
+        elif d < 0:
+            minus -= d
+
+    dmi = (
+        (plus - minus)
+        / (plus + minus)
+        if plus + minus
+        else 0
+    )
+
+    adx = abs(dmi)
+
+    a = p[-20:]
+    b = p[-40:-20]
+
+    rh = max(a)
+    rl = min(a)
+
+    ph = max(b)
+    pl = min(b)
+
+    structure = (
+        1
+        if rh > ph and rl > pl
+        else (
+            -1
+            if rh < ph and rl < pl
+            else 0
+        )
+    )
+
+    bos = (
+        1
+        if cur > ph
+        else (
+            -1
+            if cur < pl
+            else 0
+        )
+    )
+
+    prev_struct = (
+        1
+        if p[-20] > p[-40]
+        else (
+            -1
+            if p[-20] < p[-40]
+            else 0
+        )
+    )
+
+    curr_struct = (
+        1
+        if cur > p[-20]
+        else (
+            -1
+            if cur < p[-20]
+            else 0
+        )
+    )
+
+    choch = (
+        curr_struct
+        if curr_struct != prev_struct
+        else 0
+    )
+
+    look = p[-31:-1]
+
+    hi = max(look)
+    lo = min(look)
+
+    liquidity = (
+        1
+        if cur > hi
+        else (
+            -1
+            if cur < lo
+            else 0
+        )
+    )
+
+    fvg = (
+        1
+        if p[-5] < p[-3] < p[-1]
+        else (
+            -1
+            if p[-5] > p[-3] > p[-1]
+            else 0
+        )
+    )
+
+    dif = [
+        p[i] - p[i-1]
+        for i in range(
+            max(1, len(p)-15),
+            len(p)
+        )
+    ]
+
+    mx = max(
+        (
+            abs(x)
+            for x in dif
+        ),
+        default=0
+    )
+
+    ob = (
         max(
-            safe_mean(np.abs(returns)),
-            1e-12
-        )
+            dif,
+            key=abs
+        ) / mx
+        if mx
+        else 0
     )
 
-    # --------------------------------------------------------
-    # BOLLINGER BANDS
-    # --------------------------------------------------------
-
-    bb_period = 40
-
-    bb_data = prices[-bb_period:]
-
-    bb_mid = safe_mean(bb_data)
-    bb_std = safe_std(bb_data)
-
-    bb_upper = bb_mid + 2 * bb_std
-    bb_lower = bb_mid - 2 * bb_std
-
-    if bb_upper != bb_lower:
-        bb_position = (
-            (current - bb_lower)
-            / (bb_upper - bb_lower)
+    old = [
+        abs(
+            p[i] - p[i-1]
         )
-    else:
-        bb_position = 0.5
+        for i in range(
+            max(1, len(p)-60),
+            max(1, len(p)-30)
+        )
+    ]
 
-    bb_position = float(
-        np.clip(
-            (bb_position - 0.5) * 2,
-            -1,
+    new = [
+        abs(
+            p[i] - p[i-1]
+        )
+        for i in range(
+            max(1, len(p)-30),
+            len(p)
+        )
+    ]
+
+    oa = (
+        sum(old) / len(old)
+        if old
+        else 0
+    )
+
+    na = (
+        sum(new) / len(new)
+        if new
+        else 0
+    )
+
+    amd = 0
+
+    if oa:
+
+        exp = na / oa
+
+        if exp > 1.3:
+            amd = (
+                1
+                if momentum > 0
+                else -1
+            )
+
+        elif exp < 0.75:
+            amd = (
+                0.5
+                if momentum > 0
+                else -0.5
+            )
+
+    large = 0
+    since = 300
+
+    for i in range(
+        max(1, len(p)-300),
+        len(p)
+    ):
+
+        if abs(
+            (p[i] - p[i-1])
+            / p[i-1]
+            * 100
+        ) >= SPIKE_THRESHOLD:
+
+            large += 1
+            since = 0
+
+        else:
+
+            since = min(
+                since + 1,
+                300
+            )
+
+    spike_distance = since / 300
+
+    spike_frequency = min(
+        large / 10,
+        1
+    )
+
+    range10 = (
+        max(p[-10:])
+        - min(p[-10:])
+    )
+
+    range50 = (
+        max(p[-50:])
+        - min(p[-50:])
+    )
+
+    compression = (
+        1 - min(
+            range10 / range50,
             1
         )
+        if range50
+        else 0
     )
 
-    bb_width = normalize(
-        bb_upper - bb_lower,
-        current
+    tick_accel = r1 - r3
+
+    directional_pressure = (
+        pressure * 0.6
+        + dmi * 0.4
     )
 
-    # --------------------------------------------------------
-    # MOMENTUM
-    # --------------------------------------------------------
-
-    momentum = normalize(
-        prices[-1] - prices[-20],
-        scale_atr * 10
-    )
-
-    # --------------------------------------------------------
-    # TREND STRENGTH / ADX APPROXIMATION
-    # --------------------------------------------------------
-
-    movement = np.diff(prices[-60:])
-
-    up = np.sum(movement[movement > 0])
-    down = abs(np.sum(movement[movement < 0]))
-
-    total = up + down
-
-    if total > 0:
-        trend_strength = (up - down) / total
-    else:
-        trend_strength = 0.0
-
-    # ADX-like directional strength
-
-    abs_move = np.sum(np.abs(movement))
-
-    net_move = abs(prices[-1] - prices[-60])
-
-    if abs_move > 0:
-        adx_value = 100 * net_move / abs_move
-    else:
-        adx_value = 0.0
-
-    adx_norm = np.clip(adx_value / 50.0, 0, 2)
-
-    # --------------------------------------------------------
-    # MARKET STRUCTURE
-    # --------------------------------------------------------
-
-    short = prices[-40:]
-
-    first_half = short[:20]
-    second_half = short[20:]
-
-    high1 = np.max(first_half)
-    low1 = np.min(first_half)
-
-    high2 = np.max(second_half)
-    low2 = np.min(second_half)
-
-    structure = 0.0
-
-    if high2 > high1 and low2 > low1:
-        structure = 1.0
-
-    elif high2 < high1 and low2 < low1:
-        structure = -1.0
-
-    # --------------------------------------------------------
-    # BOS
-    # --------------------------------------------------------
-
-    previous_high = np.max(prices[-50:-10])
-    previous_low = np.min(prices[-50:-10])
-
-    bos = 0.0
-
-    if current > previous_high:
-        bos = 1.0
-
-    elif current < previous_low:
-        bos = -1.0
-
-    # --------------------------------------------------------
-    # CHOCH
-    # --------------------------------------------------------
-
-    older = prices[-80:-40]
-    recent = prices[-40:]
-
-    old_direction = np.sign(
-        older[-1] - older[0]
-    )
-
-    recent_direction = np.sign(
-        recent[-1] - recent[0]
-    )
-
-    choch = 0.0
-
-    if (
-        old_direction < 0
-        and recent_direction > 0
-    ):
-        choch = 1.0
-
-    elif (
-        old_direction > 0
-        and recent_direction < 0
-    ):
-        choch = -1.0
-
-    # --------------------------------------------------------
-    # LIQUIDITY SWEEP
-    # --------------------------------------------------------
-
-    window = prices[-80:-10]
-
-    previous_high = np.max(window)
-    previous_low = np.min(window)
-
-    recent_high = np.max(prices[-10:])
-    recent_low = np.min(prices[-10:])
-
-    liquidity_sweep = 0.0
-
-    if (
-        recent_high > previous_high
-        and current < previous_high
-    ):
-        liquidity_sweep = -1.0
-
-    elif (
-        recent_low < previous_low
-        and current > previous_low
-    ):
-        liquidity_sweep = 1.0
-
-    # --------------------------------------------------------
-    # FVG / GAP STYLE FEATURE
-    # --------------------------------------------------------
-
-    fvg = 0.0
-
-    if len(prices) >= 6:
-
-        p1 = prices[-6]
-        p2 = prices[-5]
-        p3 = prices[-4]
-
-        local_atr = max(
-            atr(prices[-80:]),
-            1e-12
-        )
-
-        # Upward imbalance
-        if p3 > p1:
-            gap = p3 - p1
-
-            if gap > local_atr * 0.5:
-                fvg = 1.0
-
-        # Downward imbalance
-        elif p3 < p1:
-            gap = p1 - p3
-
-            if gap > local_atr * 0.5:
-                fvg = -1.0
-
-    # --------------------------------------------------------
-    # ORDER BLOCK STYLE FEATURE
-    # --------------------------------------------------------
-
-    order_block = 0.0
-
-    local = prices[-30:]
-
-    local_mean = np.mean(local)
-    local_std = np.std(local)
-
-    if local_std > 0:
-
-        z = (
-            current - local_mean
-        ) / local_std
-
-        # Strong rejection from lower zone
-        if z < -1.5 and current > prices[-5]:
-            order_block = 1.0
-
-        # Strong rejection from upper zone
-        elif z > 1.5 and current < prices[-5]:
-            order_block = -1.0
-
-    # --------------------------------------------------------
-    # AMD
-    # Accumulation / Manipulation / Distribution
-    # --------------------------------------------------------
-
-    amd_accumulation = 0.0
-    amd_manipulation = 0.0
-    amd_distribution = 0.0
-
-    if len(prices) >= 120:
-
-        a = prices[-120:-80]
-        m = prices[-80:-40]
-        d = prices[-40:]
-
-        a_vol = safe_std(np.diff(a))
-        m_vol = safe_std(np.diff(m))
-        d_move = abs(d[-1] - d[0])
-
-        d_vol = safe_std(np.diff(d))
-
-        # accumulation = compressed range
-        if a_vol < safe_mean(
-            np.abs(np.diff(prices[-160:-120]))
-        ) * 0.8:
-            amd_accumulation = 1.0
-
-        # manipulation = sudden volatility expansion
-        if (
-            m_vol >
-            max(a_vol, 1e-12) * 1.8
-        ):
-            amd_manipulation = np.sign(
-                m[-1] - m[0]
-            )
-
-        # distribution = directional expansion
-        if (
-            d_move >
-            max(d_vol * 5, scale_atr * 5)
-        ):
-            amd_distribution = np.sign(
-                d[-1] - d[0]
-            )
-
-    # --------------------------------------------------------
-    # PREVIOUS SPIKE DISTANCE / FREQUENCY
-    # --------------------------------------------------------
-
-    spike_distance = 0.0
-    spike_frequency = 0.0
-
-    recent_returns = np.abs(
-        np.diff(prices[-500:])
-        / prices[-501:-1]
-    )
-
-    if len(recent_returns) > 30:
-
-        baseline = np.median(
-            recent_returns
-        )
-
-        threshold = max(
-            baseline * 8,
-            0.0005
-        )
-
-        spike_positions = np.where(
-            recent_returns > threshold
-        )[0]
-
-        if len(spike_positions) > 0:
-
-            distance = (
-                len(recent_returns)
-                - spike_positions[-1]
-            )
-
-            spike_distance = np.clip(
-                distance / 200.0,
-                0,
-                2
-            )
-
-            spike_frequency = np.clip(
-                len(spike_positions) / 10.0,
-                0,
-                2
-            )
-
-    # --------------------------------------------------------
-    # BUY / SELL PRESSURE
-    # --------------------------------------------------------
-
-    recent_moves = np.diff(
-        prices[-50:]
-    )
-
-    positive = np.sum(
-        recent_moves[recent_moves > 0]
-    )
-
-    negative = abs(np.sum(
-        recent_moves[recent_moves < 0]
-    ))
-
-    pressure_total = positive + negative
-
-    if pressure_total > 0:
-
-        buy_pressure = (
-            positive / pressure_total
-        )
-
-        sell_pressure = (
-            negative / pressure_total
-        )
-
-    else:
-        buy_pressure = 0.5
-        sell_pressure = 0.5
-
-    buy_pressure = (
-        buy_pressure - 0.5
-    ) * 2
-
-    sell_pressure = (
-        sell_pressure - 0.5
-    ) * 2
-
-    # --------------------------------------------------------
-    # FEATURE VECTOR
-    # --------------------------------------------------------
-
-    features = np.array([
-        ret5,
-        ret10,
-        ret20,
-        ret40,
-        ret80,
-
-        ema_fast_gap,
-        ema_slow_gap,
-
-        rsi_norm,
-        macd_norm,
-        macd_signal_norm,
-        macd_hist_norm,
-
-        atr_norm,
-        volatility_norm,
-
-        bb_position,
-        bb_width,
-
+    f = [
+        r1,
+        r3,
+        r5,
+        r10,
+        r20,
+        r50,
+        r100,
+        r200,
         momentum,
-
-        trend_strength,
-        adx_norm,
-
+        acceleration,
+        volatility,
+        pressure,
+        rsi_norm,
+        macd,
+        macd_signal,
+        atr_pct,
+        atr_move,
+        bb,
+        trend,
+        adx,
+        dmi,
         structure,
         bos,
         choch,
-
-        liquidity_sweep,
+        liquidity,
         fvg,
-
-        order_block,
-
-        amd_accumulation,
-        amd_manipulation,
-        amd_distribution,
-
+        ob,
+        amd,
         spike_distance,
         spike_frequency,
-
-        buy_pressure,
-        sell_pressure,
-
-    ], dtype=float)
-
-    features = np.nan_to_num(
-        features,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0
-    )
-
-    features = np.clip(
-        features,
-        -5,
-        5
-    )
-
-    return features
-
-
-# ============================================================
-# DIRECTION / CONFIDENCE
-# ============================================================
-
-def calculate_signal(key, features):
-
-    info = INDICES[key]
-    brain = brains[key]
-
-    ai_probability = brain.predict(features)
-
-    # BOOM -> expected upward spike
-    # CRASH -> expected downward spike
-    #
-    # Model itself predicts "spike likelihood".
-    # Direction comes from market type + direction features.
-
-    direction_features = (
-        features[0] * 0.10 +
-        features[1] * 0.10 +
-        features[2] * 0.10 +
-        features[5] * 0.10 +
-        features[6] * 0.10 +
-        features[7] * 0.08 +
-        features[10] * 0.08 +
-        features[15] * 0.08 +
-        features[18] * 0.08 +
-        features[19] * 0.06 +
-        features[20] * 0.05 +
-        features[21] * 0.05 +
-        features[23] * 0.05 +
-        features[26] * 0.05 +
-        features[29] * 0.05
-    )
-
-    # For BOOM positive direction is preferred.
-    # For CRASH negative direction is preferred.
-
-    if info["type"] == "BOOM":
-
-        directional_strength = (
-            1.0 /
-            (1.0 + math.exp(
-                -np.clip(
-                    direction_features * 3,
-                    -20,
-                    20
-                )
-            ))
-        )
-
-    else:
-
-        directional_strength = (
-            1.0 /
-            (1.0 + math.exp(
-                np.clip(
-                    direction_features * 3,
-                    -20,
-                    20
-                )
-            ))
-        )
-
-    # Combine AI spike probability + directional confirmation.
-    confidence = (
-        ai_probability * 0.65 +
-        directional_strength * 0.35
-    )
-
-    return (
-        float(confidence),
-        float(ai_probability),
-        float(directional_strength)
-    )
-
-
-# ============================================================
-# SPIKE DETECTION FOR TRAINING
-# ============================================================
-
-def detect_future_spike(
-    key,
-    start_time,
-    start_price
-):
-
-    data = ticks_data[key]
-
-    future = [
-        x for x in data
-        if x["time"] >= start_time
-        and x["time"] <= start_time + PREDICT_MAX_SECONDS
+        compression,
+        tick_accel,
+        directional_pressure
     ]
 
-    if len(future) < 5:
+    if len(f) != FEATURE_COUNT:
         return None
 
-    info = INDICES[key]
-
-    prices = np.array(
-        [x["price"] for x in future],
-        dtype=float
-    )
-
-    if info["type"] == "BOOM":
-
-        max_move = (
-            np.max(prices) - start_price
-        ) / start_price
-
-        # Strong upward movement
-        return max_move >= 0.001
-
-    else:
-
-        max_move = (
-            start_price - np.min(prices)
-        ) / start_price
-
-        # Strong downward movement
-        return max_move >= 0.001
+    return [
+        max(
+            -5,
+            min(
+                5,
+                float(x)
+            )
+        )
+        for x in f
+    ]
 
 
 # ============================================================
-# HISTORICAL TRAINING
+# HISTORICAL LABEL
 # ============================================================
 
-def historical_training(key):
+def historical_label(
+    prices,
+    timestamps,
+    i
+):
 
-    data = ticks_data[key]
-
-    if len(data) < 1000:
+    if i >= len(prices):
         return 0
 
-    prices = np.array(
-        [x["price"] for x in data],
-        dtype=float
-    )
+    base = float(prices[i])
 
-    times = np.array(
-        [x["time"] for x in data],
-        dtype=float
-    )
-
-    # Avoid training on every tick.
-    # This prevents the brain from overfitting.
-    step = 10
-
-    trained = 0
-
-    brain = brains[key]
-
-    # Use recent history.
-    start = max(
-        300,
-        len(prices) - 3000
-    )
-
-    end = len(prices) - 150
-
-    if end <= start:
+    if base == 0:
         return 0
 
-    for i in range(start, end, step):
+    base_time = (
+        float(timestamps[i])
+        if i < len(timestamps)
+        else 0
+    )
 
-        # Temporarily build feature context
-        old_data = ticks_data[key]
+    for j in range(
+        i + 1,
+        len(prices)
+    ):
 
-        # We cannot replace deque directly while websocket
-        # is running. Build a temporary local feature calculator
-        # using a small helper below.
-        features = calculate_features_from_prices(
+        future_time = (
+            float(timestamps[j])
+            if j < len(timestamps)
+            else base_time + (j - i)
+        )
+
+        dt = (
+            future_time
+            - base_time
+        )
+
+        if dt < EARLY_MIN_SECONDS:
+            continue
+
+        if dt > EARLY_MAX_SECONDS:
+            break
+
+        move = (
+            (
+                float(prices[j])
+                - base
+            )
+            / base
+            * 100
+        )
+
+        if abs(move) >= SPIKE_THRESHOLD:
+
+            if move > 0:
+                return 1
+
+            return 2
+
+    return 0
+
+
+# ============================================================
+# WARMUP
+# ============================================================
+
+def warmup_model(key):
+
+    if key in history_trained:
+        return
+
+    data = history_data[key]
+
+    if len(data) < 250:
+        logging.warning(
+            "%s not enough history for warmup: %d",
+            key,
+            len(data)
+        )
+        return
+
+    prices = [
+        x[1]
+        for x in data
+    ]
+
+    timestamps = [
+        x[0]
+        for x in data
+    ]
+
+    count = 0
+
+    start = 210
+    end = len(prices) - 1
+
+    step = max(
+        1,
+        (end - start) // 400
+    )
+
+    for i in range(
+        start,
+        end,
+        step
+    ):
+
+        features = calculate_features(
             prices[:i+1]
         )
 
         if features is None:
             continue
 
-        current_price = prices[i]
-        current_time = times[i]
+        label = historical_label(
+            prices,
+            timestamps,
+            i
+        )
 
-        future_end = current_time + 120
+        train_model(
+            key,
+            features,
+            label
+        )
 
-        future_indices = np.where(
-            (times > current_time) &
-            (times <= future_end)
-        )[0]
+        count += 1
 
-        if len(future_indices) < 5:
+        if count >= MIN_TRAINING_SAMPLES:
+            break
+
+    history_trained.add(key)
+
+    logging.info(
+        "%s warmup complete. training=%d",
+        key,
+        models[key]["samples"]
+    )
+
+    save_memory()
+
+
+# ============================================================
+# ADAPTIVE CONFIDENCE
+# ============================================================
+
+def adaptive_confidence(key):
+
+    results = recent_results[key]
+
+    if len(results) < MIN_RECENT_RESULTS:
+        return SIGNAL_CONFIDENCE
+
+    wins = sum(
+        1
+        for x in results
+        if x == 1
+    )
+
+    wr = (
+        wins / len(results)
+        if results
+        else 0
+    )
+
+    if wr >= 0.70:
+        return MIN_SIGNAL_CONFIDENCE
+
+    if wr <= 0.58:
+        return MAX_SIGNAL_CONFIDENCE
+
+    ratio = (
+        (0.70 - wr)
+        / (0.70 - 0.58)
+    )
+
+    return (
+        MIN_SIGNAL_CONFIDENCE
+        + (
+            MAX_SIGNAL_CONFIDENCE
+            - MIN_SIGNAL_CONFIDENCE
+        ) * ratio
+    )
+
+
+# ============================================================
+# SIGNAL FILTER
+# ============================================================
+
+def signal_allowed(
+    key,
+    predicted_class,
+    confidence,
+    features
+):
+
+    if predicted_class == 0:
+        return False
+
+    if models[key]["samples"] < MIN_TRAINING_SAMPLES:
+
+        diagnostics[key][
+            "blocked_training"
+        ] += 1
+
+        return False
+
+    threshold = adaptive_confidence(key)
+
+    if confidence < threshold:
+
+        diagnostics[key][
+            "blocked_confidence"
+        ] += 1
+
+        return False
+
+    if (
+        time.time()
+        - last_signal_time[key]
+        < COOLDOWN_SECONDS
+    ):
+
+        diagnostics[key][
+            "blocked_cooldown"
+        ] += 1
+
+        return False
+
+    momentum = features[8]
+
+    if predicted_class == 1 and momentum < -0.02:
+
+        diagnostics[key][
+            "blocked_direction"
+        ] += 1
+
+        return False
+
+    if predicted_class == 2 and momentum > 0.02:
+
+        diagnostics[key][
+            "blocked_direction"
+        ] += 1
+
+        return False
+
+    results = recent_results[key]
+
+    if len(results) >= MIN_RECENT_RESULTS:
+
+        wins = sum(
+            1
+            for x in results
+            if x == 1
+        )
+
+        wr = wins / len(results)
+
+        if wr < 0.55:
+            return False
+
+    return True
+
+
+# ============================================================
+# EVALUATION / LEARNING
+# ============================================================
+
+async def evaluate_predictions(
+    key,
+    now_ts,
+    current_price
+):
+
+    pending = pending_predictions[key]
+
+    if not pending:
+        return
+
+    remaining = []
+
+    for pred in pending:
+
+        age = (
+            now_ts
+            - pred["time"]
+        )
+
+        if age < EARLY_MIN_SECONDS:
+
+            remaining.append(pred)
             continue
 
-        future_prices = prices[
-            future_indices
-        ]
+        if age > EARLY_MAX_SECONDS:
 
-        if INDICES[key]["type"] == "BOOM":
+            continue
 
-            move = (
-                np.max(future_prices)
-                - current_price
-            ) / current_price
+        move = (
+            (
+                current_price
+                - pred["price"]
+            )
+            / pred["price"]
+            * 100
+        )
+
+        direction = pred["direction"]
+
+        success = False
+
+        if direction == "BUY" and move >= SPIKE_THRESHOLD:
+            success = True
+
+        elif direction == "SELL" and move <= -SPIKE_THRESHOLD:
+            success = True
+
+        if success:
+
+            learn_stats[key]["ok"] += 1
+            recent_results[key].append(1)
+
+            actual_class = (
+                1
+                if direction == "BUY"
+                else 2
+            )
 
         else:
 
-            move = (
-                current_price
-                - np.min(future_prices)
-            ) / current_price
+            learn_stats[key]["fail"] += 1
+            recent_results[key].append(0)
 
-        target = 1 if move >= 0.001 else 0
+            actual_class = 0
 
-        brain.learn(
-            features,
-            target
-        )
-
-        trained += 1
-
-    brain.save()
-
-    return trained
-
-
-# ============================================================
-# FEATURE CALCULATOR FOR HISTORICAL TRAINING
-# ============================================================
-
-def calculate_features_from_prices(prices):
-
-    if len(prices) < 250:
-        return None
-
-    # Reuse current feature engine by temporarily using
-    # an isolated calculation context.
-
-    current = float(prices[-1])
-
-    if current <= 0:
-        return None
-
-    def ret(period):
-
-        if len(prices) <= period:
-            return 0
-
-        return (
-            prices[-1] -
-            prices[-1-period]
-        ) / prices[-1-period]
-
-    r5 = ret(5)
-    r10 = ret(10)
-    r20 = ret(20)
-    r40 = ret(40)
-    r80 = ret(80)
-
-    atr_value = atr(
-        prices[-100:],
-        14
-    )
-
-    scale = max(
-        atr_value,
-        current * 1e-8
-    )
-
-    ef = ema(prices[-60:], 9)
-    es = ema(prices[-120:], 21)
-
-    ema_fast_gap = normalize(
-        current - ef,
-        scale
-    )
-
-    ema_slow_gap = normalize(
-        current - es,
-        scale
-    )
-
-    rsi_value = rsi(
-        prices,
-        14
-    )
-
-    rsi_norm = (
-        rsi_value - 50
-    ) / 50
-
-    e12 = ema(prices[-100:], 12)
-    e26 = ema(prices[-150:], 26)
-
-    macd_value = e12 - e26
-
-    macd_norm = normalize(
-        macd_value,
-        scale
-    )
-
-    macd_signal = 0.0
-    macd_hist = macd_value
-
-    macd_signal_norm = normalize(
-        macd_signal,
-        scale
-    )
-
-    macd_hist_norm = normalize(
-        macd_hist,
-        scale
-    )
-
-    returns = (
-        np.diff(prices[-100:])
-        / prices[-101:-1]
-    )
-
-    volatility = safe_std(
-        returns
-    )
-
-    volatility_norm = normalize(
-        volatility,
-        max(
-            safe_mean(
-                np.abs(returns)
-            ),
-            1e-12
-        )
-    )
-
-    bb_data = prices[-40:]
-
-    mid = np.mean(bb_data)
-    sd = np.std(bb_data)
-
-    upper = mid + 2 * sd
-    lower = mid - 2 * sd
-
-    if upper != lower:
-        bb_pos = (
-            (current - lower)
-            / (upper - lower)
-        )
-    else:
-        bb_pos = 0.5
-
-    bb_pos = np.clip(
-        (bb_pos - 0.5) * 2,
-        -1,
-        1
-    )
-
-    bb_width = normalize(
-        upper - lower,
-        current
-    )
-
-    momentum = normalize(
-        prices[-1] - prices[-20],
-        scale * 10
-    )
-
-    movement = np.diff(
-        prices[-60:]
-    )
-
-    up = np.sum(
-        movement[movement > 0]
-    )
-
-    down = abs(
-        np.sum(
-            movement[movement < 0]
-        )
-    )
-
-    total = up + down
-
-    trend_strength = (
-        (up - down) / total
-        if total > 0
-        else 0
-    )
-
-    abs_move = np.sum(
-        np.abs(movement)
-    )
-
-    net_move = abs(
-        prices[-1] - prices[-60]
-    )
-
-    adx_value = (
-        100 * net_move / abs_move
-        if abs_move > 0
-        else 0
-    )
-
-    adx_norm = np.clip(
-        adx_value / 50,
-        0,
-        2
-    )
-
-    # Structure
-    first = prices[-40:-20]
-    second = prices[-20:]
-
-    structure = 0
-
-    if (
-        np.max(second) > np.max(first)
-        and
-        np.min(second) > np.min(first)
-    ):
-        structure = 1
-
-    elif (
-        np.max(second) < np.max(first)
-        and
-        np.min(second) < np.min(first)
-    ):
-        structure = -1
-
-    previous_high = np.max(
-        prices[-50:-10]
-    )
-
-    previous_low = np.min(
-        prices[-50:-10]
-    )
-
-    bos = 0
-
-    if current > previous_high:
-        bos = 1
-
-    elif current < previous_low:
-        bos = -1
-
-    older = prices[-80:-40]
-    recent = prices[-40:]
-
-    old_direction = np.sign(
-        older[-1] - older[0]
-    )
-
-    recent_direction = np.sign(
-        recent[-1] - recent[0]
-    )
-
-    choch = 0
-
-    if old_direction < 0 and recent_direction > 0:
-        choch = 1
-
-    elif old_direction > 0 and recent_direction < 0:
-        choch = -1
-
-    # Liquidity
-    window = prices[-80:-10]
-
-    ph = np.max(window)
-    pl = np.min(window)
-
-    rh = np.max(prices[-10:])
-    rl = np.min(prices[-10:])
-
-    liquidity = 0
-
-    if rh > ph and current < ph:
-        liquidity = -1
-
-    elif rl < pl and current > pl:
-        liquidity = 1
-
-    # FVG
-    fvg = 0
-
-    if len(prices) >= 6:
-
-        p1 = prices[-6]
-        p3 = prices[-4]
-
-        if abs(p3 - p1) > scale * 0.5:
-            fvg = np.sign(
-                p3 - p1
-            )
-
-    # Order block
-    ob = 0
-
-    local = prices[-30:]
-
-    local_mean = np.mean(local)
-    local_std = np.std(local)
-
-    if local_std > 0:
-
-        z = (
-            current - local_mean
-        ) / local_std
-
-        if z < -1.5:
-            ob = 1
-
-        elif z > 1.5:
-            ob = -1
-
-    # AMD
-    amd_a = 0
-    amd_m = 0
-    amd_d = 0
-
-    if len(prices) >= 120:
-
-        a = prices[-120:-80]
-        m = prices[-80:-40]
-        d = prices[-40:]
-
-        av = safe_std(
-            np.diff(a)
-        )
-
-        mv = safe_std(
-            np.diff(m)
-        )
-
-        if mv > max(av, 1e-12) * 1.8:
-            amd_m = np.sign(
-                m[-1] - m[0]
-            )
-
-        if av < (
-            safe_mean(
-                np.abs(
-                    np.diff(
-                        prices[-160:-120]
-                    )
-                )
-            ) * 0.8
-        ):
-            amd_a = 1
-
-        if abs(d[-1] - d[0]) > scale * 5:
-            amd_d = np.sign(
-                d[-1] - d[0]
-            )
-
-    # Spike timing
-    rr = np.abs(
-        np.diff(prices[-500:])
-        / prices[-501:-1]
-    )
-
-    spike_distance = 0
-    spike_frequency = 0
-
-    if len(rr) > 30:
-
-        baseline = np.median(rr)
-
-        threshold = max(
-            baseline * 8,
-            0.0005
-        )
-
-        pos = np.where(
-            rr > threshold
-        )[0]
-
-        if len(pos):
-
-            distance = (
-                len(rr) - pos[-1]
-            )
-
-            spike_distance = np.clip(
-                distance / 200,
-                0,
-                2
-            )
-
-            spike_frequency = np.clip(
-                len(pos) / 10,
-                0,
-                2
-            )
-
-    # Pressure
-    moves = np.diff(
-        prices[-50:]
-    )
-
-    positive = np.sum(
-        moves[moves > 0]
-    )
-
-    negative = abs(
-        np.sum(
-            moves[moves < 0]
-        )
-    )
-
-    total_pressure = positive + negative
-
-    if total_pressure:
-
-        buy = (
-            positive / total_pressure
-        )
-
-        sell = (
-            negative / total_pressure
-        )
-
-    else:
-
-        buy = 0.5
-        sell = 0.5
-
-    buy = (
-        buy - 0.5
-    ) * 2
-
-    sell = (
-        sell - 0.5
-    ) * 2
-
-    result = np.array([
-        r5,
-        r10,
-        r20,
-        r40,
-        r80,
-
-        ema_fast_gap,
-        ema_slow_gap,
-
-        rsi_norm,
-        macd_norm,
-        macd_signal_norm,
-        macd_hist_norm,
-
-        normalize(atr_value, current),
-        volatility_norm,
-
-        bb_pos,
-        bb_width,
-
-        momentum,
-
-        trend_strength,
-        adx_norm,
-
-        structure,
-        bos,
-        choch,
-
-        liquidity,
-        fvg,
-
-        ob,
-
-        amd_a,
-        amd_m,
-        amd_d,
-
-        spike_distance,
-        spike_frequency,
-
-        buy,
-        sell,
-    ])
-
-    return np.nan_to_num(
-        np.clip(result, -5, 5)
-    )
-
-
-# ============================================================
-# SIGNAL EVALUATION
-# ============================================================
-
-async def evaluate_prediction(
-    key,
-    prediction
-):
-
-    await asyncio.sleep(
-        EVALUATION_DELAY
-    )
-
-    data = ticks_data[key]
-
-    start_time = prediction["time"]
-    start_price = prediction["price"]
-
-    future = [
-        x for x in data
-        if start_time <= x["time"]
-        <= start_time + PREDICT_MAX_SECONDS
-    ]
-
-    if len(future) < 5:
-        return
-
-    prices = np.array(
-        [x["price"] for x in future],
-        dtype=float
-    )
-
-    info = INDICES[key]
-
-    if info["type"] == "BOOM":
-
-        move = (
-            np.max(prices) -
-            start_price
-        ) / start_price
-
-    else:
-
-        move = (
-            start_price -
-            np.min(prices)
-        ) / start_price
-
-    success = move >= 0.001
-
-    brain = brains[key]
-
-    # Learn from actual outcome.
-    brain.learn(
-        prediction["features"],
-        1 if success else 0
-    )
-
-    learn_stats[key]["training"] = (
-        brain.samples
-    )
-
-    if success:
-
-        learn_stats[key]["ok"] += 1
-
-    else:
-
-        learn_stats[key]["fail"] += 1
-
-    if success:
-
-        logging.info(
-            f"{key} PREDICTION OK | "
-            f"move={move*100:.3f}%"
-        )
-
-    else:
-
-        logging.info(
-            f"{key} PREDICTION FAIL | "
-            f"move={move*100:.3f}%"
-        )
-
-    brain.save()
-
-
-# ============================================================
-# REAL-TIME SIGNAL ENGINE
-# ============================================================
-
-async def analyze_market(
-    key,
-    app
-):
-
-    if key not in active:
-        return
-
-    data = ticks_data[key]
-
-    if len(data) < 300:
-        return
-
-    now = time.time()
-
-    # --------------------------------------------------------
-    # COOLDOWN
-    # --------------------------------------------------------
-
-    if (
-        now - last_signal_time[key]
-        < SIGNAL_COOLDOWN
-    ):
-        return
-
-    features = calculate_features(key)
-
-    if features is None:
-        return
-
-    confidence, ai_probability, direction_strength = (
-        calculate_signal(
+        train_model(
             key,
-            features
+            pred["features"],
+            actual_class
         )
-    )
 
-    brain = brains[key]
+        save_memory()
 
-    # --------------------------------------------------------
-    # WARM-UP
-    #
-    # Before enough learning, require extremely strong
-    # confirmation.
-    # --------------------------------------------------------
+    pending_predictions[key] = remaining
 
-    if brain.samples < MIN_TRAINING_SAMPLES:
 
-        required_confidence = 0.88
+# ============================================================
+# TELEGRAM SIGNAL
+# ============================================================
 
-    else:
-
-        required_confidence = MIN_CONFIDENCE
-
-    # --------------------------------------------------------
-    # MARGIN / CONFIDENCE FILTER
-    # --------------------------------------------------------
-
-    if confidence < required_confidence:
-        return
-
-    if direction_strength < 0.70:
-        return
-
-    if (
-        ai_probability < 0.65
-        and brain.samples >= MIN_TRAINING_SAMPLES
-    ):
-        return
-
-    # --------------------------------------------------------
-    # SIGNAL
-    # --------------------------------------------------------
+async def send_signal(
+    app,
+    key,
+    direction,
+    confidence,
+    probabilities
+):
 
     info = INDICES[key]
 
-    price = data[-1]["price"]
-
-    if info["type"] == "BOOM":
-
-        action = (
-            "BUY 🟢"
-        )
-
+    if direction == "BUY":
+        emoji = "🟢"
+        action = "BUY"
     else:
+        emoji = "🔴"
+        action = "SELL"
 
-        action = (
-            "SELL 🔴"
-        )
-
-    last_signal_time[key] = now
-
-    learn_stats[key]["signals"] += 1
-
-    prediction = {
-        "time": now,
-        "price": price,
-        "features": features.tolist(),
-        "confidence": confidence,
-        "ai_probability": ai_probability,
-    }
-
-    pending_predictions[key].append(
-        prediction
-    )
-
-    # Keep only recent pending predictions.
-    pending_predictions[key] = (
-        pending_predictions[key][-5:]
-    )
-
-    text = (
-        "🚨 PREDICTIVE AI SPIKE SIGNAL\n\n"
+    message = (
+        "🧠🔥 AI MANIAC V4 SIGNAL\n\n"
         f"{info['name']}\n"
-        f"📌 {action}\n\n"
-        f"🧠 AI confidence: "
-        f"{confidence*100:.1f}%\n"
-        f"📊 Spike probability: "
-        f"{ai_probability*100:.1f}%\n"
-        f"🎯 Direction confirmation: "
-        f"{direction_strength*100:.1f}%\n\n"
-        "⏱ Expected window: "
-        "NEXT 1–2 MINUTES\n\n"
-        f"💰 Price: {price}\n"
-        f"🧠 Training samples: "
-        f"{brain.samples}\n\n"
-        "⚠️ Predictive signal — "
-        "not a guarantee."
+        f"{emoji} {action}\n\n"
+        f"AI Confidence: {confidence * 100:.1f}%\n"
+        "⏱ Prediction window: 1–2 minutes\n"
+        "🎯 Spike prediction mode\n"
+        "🧠 AI learning: ON\n\n"
+        "⚠️ Signal is predictive, not reactive."
     )
 
-    for cid in list(chat_ids):
+    for chat_id in list(chat_ids):
 
         try:
 
             await app.bot.send_message(
-                chat_id=cid,
-                text=text
+                chat_id=chat_id,
+                text=message
             )
 
         except Exception as e:
 
             logging.error(
-                f"Telegram signal error: {e}"
+                "Telegram send error: %s",
+                e
             )
-
-    logging.info(
-        f"{key} SIGNAL {action} | "
-        f"confidence={confidence:.3f}"
-    )
-
-    # Evaluate asynchronously.
-    asyncio.create_task(
-        evaluate_prediction(
-            key,
-            prediction
-        )
-    )
 
 
 # ============================================================
@@ -2001,177 +1238,221 @@ async def deriv_ws(
     app
 ):
 
-    uri = (
-        "wss://ws.binaryws.com/"
-        "websockets/v3?app_id=1089"
-    )
+    url = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
     async with websockets.connect(
-        uri,
+        url,
         ping_interval=20,
-        ping_timeout=20,
-        close_timeout=10,
+        ping_timeout=20
     ) as ws:
-
-        # ----------------------------------------------------
-        # HISTORICAL DATA
-        # ----------------------------------------------------
 
         await ws.send(
             json.dumps({
                 "ticks_history": symbol,
-                "count": HISTORY_COUNT,
+                "count": WARMUP_HISTORY,
                 "end": "latest",
-                "style": "ticks",
-                "subscribe": 1,
+                "style": "ticks"
             })
         )
-
-        # ----------------------------------------------------
-        # LIVE SUBSCRIPTION
-        # ----------------------------------------------------
 
         await ws.send(
             json.dumps({
                 "ticks": symbol,
-                "subscribe": 1,
+                "subscribe": 1
             })
         )
 
-        logging.info(
-            f"{key} websocket connected"
-        )
-
-        history_loaded = False
-
         while key in active:
 
+            raw = await ws.recv()
+
             try:
+                msg = json.loads(raw)
 
-                raw = await asyncio.wait_for(
-                    ws.recv(),
-                    timeout=40
-                )
+            except Exception:
+                continue
 
-            except asyncio.TimeoutError:
-
-                logging.warning(
-                    f"{key} websocket timeout"
-                )
-
-                break
-
-            msg = json.loads(raw)
-
-            # ------------------------------------------------
-            # HISTORY
-            # ------------------------------------------------
+            # ---------------- HISTORY ----------------
 
             if "history" in msg:
 
-                try:
+                prices = (
+                    msg["history"]
+                    .get("prices", [])
+                )
 
-                    prices = [
-                        float(x)
-                        for x in msg["history"]["prices"]
-                    ]
+                times = (
+                    msg["history"]
+                    .get("times", [])
+                )
 
-                    times = msg["history"].get(
-                        "times",
-                        []
-                    )
+                history_data[key] = []
 
-                    ticks_data[key].clear()
+                for i, price in enumerate(prices):
 
-                    if times and len(times) == len(prices):
+                    try:
 
-                        for p, t in zip(
-                            prices,
-                            times
-                        ):
+                        ts = (
+                            float(times[i])
+                            if i < len(times)
+                            else 0.0
+                        )
 
-                            ticks_data[key].append({
-                                "price": p,
-                                "time": float(t)
-                            })
+                        history_data[key].append(
+                            (
+                                ts,
+                                float(price)
+                            )
+                        )
 
-                    else:
+                    except Exception:
+                        pass
 
-                        now = time.time()
+                if history_data[key]:
 
-                        for i, p in enumerate(prices):
+                    for item in history_data[key][
+                        -LIVE_HISTORY:
+                    ]:
 
-                            ticks_data[key].append({
-                                "price": p,
-                                "time": now - (
-                                    len(prices) - i
-                                )
-                            })
+                        ticks_data[key].append(
+                            item
+                        )
 
-                    history_loaded = True
+                await asyncio.to_thread(
+                    warmup_model,
+                    key
+                )
 
-                    logging.info(
-                        f"{key} history loaded: "
-                        f"{len(ticks_data[key])}"
-                    )
+                logging.info(
+                    "%s history loaded: %d ticks",
+                    key,
+                    len(history_data[key])
+                )
 
-                except Exception as e:
-
-                    logging.error(
-                        f"{key} history error: {e}"
-                    )
-
-            # ------------------------------------------------
-            # LIVE TICK
-            # ------------------------------------------------
+            # ---------------- LIVE TICK ----------------
 
             if "tick" in msg:
 
-                try:
+                tick = msg["tick"]
 
-                    tick = msg["tick"]
+                try:
 
                     price = float(
                         tick["quote"]
                     )
 
-                    tick_time = float(
+                    timestamp = float(
                         tick.get(
                             "epoch",
                             time.time()
                         )
                     )
 
-                    ticks_data[key].append({
-                        "price": price,
-                        "time": tick_time
-                    })
+                except Exception:
+                    continue
+
+                ticks_data[key].append(
+                    (
+                        timestamp,
+                        price
+                    )
+                )
+
+                diagnostics[key]["ticks"] += 1
+                diagnostics[key]["last_tick"] = timestamp
+
+                prices = [
+                    x[1]
+                    for x in ticks_data[key]
+                ]
+
+                if len(prices) < 210:
+                    continue
+
+                await evaluate_predictions(
+                    key,
+                    timestamp,
+                    price
+                )
+
+                try:
+
+                    features = calculate_features(
+                        prices
+                    )
 
                 except Exception as e:
 
+                    diagnostics[key]["errors"] += 1
+                    diagnostics[key]["last_error"] = str(e)
+
                     logging.error(
-                        f"{key} tick error: {e}"
+                        "%s feature error: %s",
+                        key,
+                        e
                     )
 
-            # ------------------------------------------------
-            # ANALYSIS
-            # ------------------------------------------------
+                    continue
 
-            if (
-                history_loaded
-                and
-                len(ticks_data[key]) >= 300
-            ):
+                if features is None:
+                    continue
 
-                await analyze_market(
+                diagnostics[key]["features"] += 1
+
+                (
+                    predicted_class,
+                    confidence,
+                    probabilities
+                ) = predict(
                     key,
-                    app
+                    features
                 )
 
+                diagnostics[key][
+                    "last_confidence"
+                ] = confidence
 
-# ============================================================
-# WEBSOCKET RECONNECT
-# ============================================================
+                if predicted_class != 0:
+                    diagnostics[key][
+                        "candidates"
+                    ] += 1
+
+                if not signal_allowed(
+                    key,
+                    predicted_class,
+                    confidence,
+                    features
+                ):
+                    continue
+
+                direction = (
+                    "BUY"
+                    if predicted_class == 1
+                    else "SELL"
+                )
+
+                pending_predictions[key].append(
+                    {
+                        "time": timestamp,
+                        "price": price,
+                        "direction": direction,
+                        "features": features,
+                        "confidence": confidence,
+                    }
+                )
+
+                last_signal_time[key] = time.time()
+
+                diagnostics[key]["signals"] += 1
+
+                await send_signal(
+                    app,
+                    key,
+                    direction,
+                    confidence,
+                    probabilities
+                )
+
 
 async def start_ws(
     symbol,
@@ -2179,7 +1460,6 @@ async def start_ws(
     app
 ):
 
-    # Only one connection loop per index.
     while key in active:
 
         try:
@@ -2190,20 +1470,84 @@ async def start_ws(
                 app
             )
 
+        except asyncio.CancelledError:
+
+            return
+
         except Exception as e:
 
             logging.error(
-                f"{key} websocket error: {e}"
+                "%s websocket error: %s",
+                key,
+                e
             )
 
-        if key in active:
-
-            await asyncio.sleep(5)
+            if key in active:
+                await asyncio.sleep(5)
 
 
 # ============================================================
-# TELEGRAM /START
+# KEEP ALIVE
 # ============================================================
+
+def keep_alive():
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
+    )
+
+    class Handler(
+        BaseHTTPRequestHandler
+    ):
+
+        def do_GET(self):
+
+            self.send_response(200)
+            self.end_headers()
+
+            self.wfile.write(
+                b"AI MANIAC V4 LIVE"
+            )
+
+        def log_message(
+            self,
+            *args
+        ):
+            return
+
+    HTTPServer(
+        ("0.0.0.0", port),
+        Handler
+    ).serve_forever()
+
+
+threading.Thread(
+    target=keep_alive,
+    daemon=True
+).start()
+
+
+# ============================================================
+# TELEGRAM UI
+# ============================================================
+
+def index_buttons():
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"{'✅' if k in active else '❌'} {v['name']}",
+                    callback_data=k
+                )
+            ]
+            for k, v in INDICES.items()
+        ]
+    )
+
 
 async def start(
     update: Update,
@@ -2214,39 +1558,43 @@ async def start(
         update.effective_chat.id
     )
 
-    buttons = [
-        [
-            InlineKeyboardButton(
-                f"{'✅' if k in active else '❌'} "
-                f"{v['name']}",
-                callback_data=k
+    for key in INDICES:
+
+        active.add(key)
+
+        if (
+            key not in ws_tasks
+            or ws_tasks[key].done()
+        ):
+
+            ws_tasks[key] = (
+                asyncio.create_task(
+                    start_ws(
+                        INDICES[key]["symbol"],
+                        key,
+                        context.application
+                    )
+                )
             )
-        ]
-        for k, v in INDICES.items()
-    ]
 
     await update.message.reply_text(
-        "🧠 AI PREDICTIVE SPIKE BOT\n\n"
-        "ЗӨВХӨН 7 ИНДЕКС\n"
-        "• BOOM 1000\n"
-        "• CRASH 1000\n"
-        "• BOOM 500\n"
-        "• CRASH 500\n"
-        "• BOOM 600\n"
-        "• CRASH 900\n"
-        "• BOOM 900\n\n"
-        "AI нь spike-ийг 1–2 минутын "
-        "өмнөөс таамаглахыг оролдоно.\n\n"
-        "🧠 Online learning идэвхтэй.",
-        reply_markup=InlineKeyboardMarkup(
-            buttons
-        )
+
+        "🧠🔥 AI MANIAC V4\n\n"
+
+        "ЗӨВХӨН 7 BOOM / CRASH INDEX\n\n"
+
+        "✅ 7 индекс бүгд идэвхжлээ.\n"
+        "📡 Live tick data авч байна.\n"
+        "🧠 AI historical data-аар warm-up хийнэ.\n"
+        "🔄 Шинэ prediction бүрийн дараа өөрийгөө шинэчилнэ.\n"
+        "💾 Сурсан жинг memory-д хадгална.\n"
+        "🎯 Adaptive 75–80% confidence filter.\n\n"
+
+        "⚠️ Эхлээд суралцана. Шууд ашиг амлахгүй.",
+
+        reply_markup=index_buttons()
     )
 
-
-# ============================================================
-# TELEGRAM BUTTON
-# ============================================================
 
 async def button(
     update: Update,
@@ -2259,9 +1607,6 @@ async def button(
 
     key = q.data
 
-    if key not in INDICES:
-        return
-
     chat_ids.add(
         q.message.chat.id
     )
@@ -2270,46 +1615,45 @@ async def button(
 
         active.remove(key)
 
+        task = ws_tasks.get(key)
+
+        if task and not task.done():
+            task.cancel()
+
         await q.message.reply_text(
-            f"❌ {INDICES[key]['name']} "
-            "унтраалаа!"
+            f"❌ {INDICES[key]['name']} унтарлаа."
         )
 
     else:
 
         active.add(key)
 
+        if (
+            key not in ws_tasks
+            or ws_tasks[key].done()
+        ):
+
+            ws_tasks[key] = (
+                asyncio.create_task(
+                    start_ws(
+                        INDICES[key]["symbol"],
+                        key,
+                        context.application
+                    )
+                )
+            )
+
         await q.message.reply_text(
-            f"✅ {INDICES[key]['name']} "
-            "идэвхжлээ!\n\n"
-            "🧠 AI analysis эхэллээ."
+            f"✅ {INDICES[key]['name']} идэвхжлээ!\n"
+            f"🧠 Training: {models[key]['samples']}\n"
+            f"🎯 Signal threshold: "
+            f"{adaptive_confidence(key) * 100:.0f}%"
         )
-
-        asyncio.create_task(
-            start_ws(
-                INDICES[key]["symbol"],
-                key,
-                context.application
-            )
-        )
-
-    buttons = [
-        [
-            InlineKeyboardButton(
-                f"{'✅' if k in active else '❌'} "
-                f"{v['name']}",
-                callback_data=k
-            )
-        ]
-        for k, v in INDICES.items()
-    ]
 
     try:
 
         await q.edit_message_reply_markup(
-            reply_markup=InlineKeyboardMarkup(
-                buttons
-            )
+            reply_markup=index_buttons()
         )
 
     except Exception:
@@ -2317,7 +1661,7 @@ async def button(
 
 
 # ============================================================
-# TELEGRAM /STATUS
+# STATUS
 # ============================================================
 
 async def status_cmd(
@@ -2330,53 +1674,67 @@ async def status_cmd(
     )
 
     msg = (
-        "📊 AI PREDICTIVE STATUS\n\n"
+        "🧠🔥 AI MANIAC V4 STATUS\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
     )
 
-    for k, v in INDICES.items():
+    for key, info in INDICES.items():
 
-        brain = brains[k]
-        stats = learn_stats[k]
+        m = models[key]
 
-        msg += (
-            f"{'✅' if k in active else '❌'} "
-            f"{v['name']}\n"
-            f"Ticks: "
-            f"{len(ticks_data[k])}/{MAX_TICKS}\n"
-            f"Signals: "
-            f"{stats['signals']}\n"
-            f"AI Training: "
-            f"{brain.samples}\n"
-            f"OK: {stats['ok']} | "
-            f"FAIL: {stats['fail']}\n"
+        ok = learn_stats[key]["ok"]
+        fail = learn_stats[key]["fail"]
+
+        total = ok + fail
+
+        wr = (
+            ok / total * 100.0
+            if total
+            else 0.0
         )
 
-        if (
-            stats["ok"] +
-            stats["fail"]
-        ) > 0:
+        msg += (
 
-            accuracy = (
-                stats["ok"]
-                /
-                (
-                    stats["ok"] +
-                    stats["fail"]
-                )
-            ) * 100
+            f"{'🟢' if key in active else '⚪'} "
+            f"{info['name']}\n"
 
-            msg += (
-                f"Accuracy: "
-                f"{accuracy:.1f}%\n"
-            )
+            f"Ticks: "
+            f"{len(ticks_data[key])}/"
+            f"{LIVE_HISTORY}\n"
 
-        msg += "\n"
+            f"AI Training: "
+            f"{m['samples']}\n"
+
+            f"WIN: {ok} | LOSS: {fail}\n"
+
+            f"WinRate: "
+            f"{wr:.1f}%\n"
+
+            f"Pending: "
+            f"{len(pending_predictions[key])} "
+            f"| Candidates: "
+            f"{diagnostics[key]['candidates']}\n"
+
+            f"Signals: "
+            f"{diagnostics[key]['signals']} "
+            f"| Errors: "
+            f"{diagnostics[key]['errors']}\n\n"
+        )
 
     msg += (
+
+        "━━━━━━━━━━━━━━━━━━\n"
+
         f"🟢 Active: "
-        f"{len(active)}/7\n\n"
-        "🧠 Persistent AI brain: ON\n"
-        "🎯 Objective: NEXT SPIKE"
+        f"{len(active)}/7\n"
+
+        "🧠 Online learning: ON\n"
+
+        "💾 Persistent memory: ON\n"
+
+        "🎯 Adaptive confidence: 75–80%\n"
+
+        "⚠️ WinRate нь бодит үр дүнгээр тооцогдоно."
     )
 
     await update.message.reply_text(
@@ -2385,8 +1743,51 @@ async def status_cmd(
 
 
 # ============================================================
-# TELEGRAM /TEST
-# IMPORTANT: PRESERVED
+# AI STATUS
+# ============================================================
+
+async def ai_cmd(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat_ids.add(
+        update.effective_chat.id
+    )
+
+    msg = (
+        "🧠🔥 AI BRAIN\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    for key, info in INDICES.items():
+
+        msg += (
+
+            f"\n{info['name']}\n"
+
+            f"Learned: "
+            f"{models[key]['samples']}\n"
+
+            f"Live WIN: "
+            f"{learn_stats[key]['ok']}\n"
+
+            f"Live LOSS: "
+            f"{learn_stats[key]['fail']}\n"
+        )
+
+    msg += (
+        "\n━━━━━━━━━━━━━━━━━━\n"
+        "7 индекс тус бүр өөрийн model-той."
+    )
+
+    await update.message.reply_text(
+        msg
+    )
+
+
+# ============================================================
+# TEST
 # ============================================================
 
 async def test_cmd(
@@ -2399,24 +1800,26 @@ async def test_cmd(
     )
 
     await update.message.reply_text(
-        "⚠️ PREDICTIVE MANIAC\n"
-        "BOOM1000 - BUY NOW 🟢\n"
-        "Ticks:500 Drift 0.3% ✅\n"
-        "AI МАНГАС TEST OK!"
+
+        "🧪 AI MANIAC V4 TEST\n\n"
+
+        "Telegram: OK ✅\n"
+        "7 Index engine: OK ✅\n"
+        "Historical warm-up: ON ✅\n"
+        "Online learning: ON ✅\n"
+        "Persistent memory: ON ✅\n"
+        "Adaptive 75–80% signal filter: ON ✅\n"
+        "Auto /start activation: ON ✅\n\n"
+
+        "⚠️ TEST MESSAGE ONLY"
     )
 
 
 # ============================================================
-# APPLICATION
+# MAIN
 # ============================================================
 
-if not TELEGRAM_TOKEN:
-
-    raise RuntimeError(
-        "TELEGRAM_TOKEN environment variable "
-        "not found."
-    )
-
+load_memory()
 
 app = (
     ApplicationBuilder()
@@ -2433,15 +1836,22 @@ app.add_handler(
 
 app.add_handler(
     CommandHandler(
-        "test",
-        test_cmd
+        "status",
+        status_cmd
     )
 )
 
 app.add_handler(
     CommandHandler(
-        "status",
-        status_cmd
+        "ai",
+        ai_cmd
+    )
+)
+
+app.add_handler(
+    CommandHandler(
+        "test",
+        test_cmd
     )
 )
 
@@ -2452,35 +1862,14 @@ app.add_handler(
 )
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 if __name__ == "__main__":
 
     logging.info(
-        "===================================="
+        "🔥 AI MANIAC V4 STARTING"
     )
 
     logging.info(
-        "AI PREDICTIVE SPIKE BOT STARTING"
-    )
-
-    logging.info(
-        "7 INDICES ONLY"
-    )
-
-    logging.info(
-        "BOOM1000 / CRASH1000 / BOOM500 / "
-        "CRASH500 / BOOM600 / CRASH900 / BOOM900"
-    )
-
-    logging.info(
-        "Telegram delivery path preserved"
-    )
-
-    logging.info(
-        "===================================="
+        "ONLY 7 BOOM/CRASH INDICES"
     )
 
     app.run_polling()
