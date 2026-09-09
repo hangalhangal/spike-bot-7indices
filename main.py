@@ -9,90 +9,88 @@ from collections import deque
 
 import websockets
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
 )
 
-
-# =========================================================
-# LOGGING
-# =========================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN missing")
 
 APP_ID = os.getenv("DERIV_APP_ID", "1089")
 
-
-# =========================================================
-# 7 INDEX
-# =========================================================
+# ============================================================
+# AI МАНГАС V5 FIX
+# ONLY 7 BOOM / CRASH INDICES
+# ============================================================
 
 INDICES = {
-    "BOOM1000": "Boom 1000 Index",
-    "BOOM500": "Boom 500 Index",
-    "BOOM600": "Boom 600 Index",
-    "BOOM900": "Boom 900 Index",
-    "CRASH1000": "Crash 1000 Index",
-    "CRASH500": "Crash 500 Index",
-    "CRASH900": "Crash 900 Index",
+    "BOOM1000": {"name": "Boom 1000 Index"},
+    "BOOM500": {"name": "Boom 500 Index"},
+    "BOOM600": {"name": "Boom 600 Index"},
+    "BOOM900": {"name": "Boom 900 Index"},
+    "CRASH1000": {"name": "Crash 1000 Index"},
+    "CRASH500": {"name": "Crash 500 Index"},
+    "CRASH900": {"name": "Crash 900 Index"},
 }
 
+active = set()
+chat_ids = set()
 
-# =========================================================
-# STATE
-# =========================================================
-
-active_symbols_raw = []
-
-api_status = {
-    "stage": "IDLE",
-    "connected": 0,
-    "error": ""
+ticks = {
+    k: deque(maxlen=500)
+    for k in INDICES
 }
 
+diag = {
+    k: {
+        "stage": "IDLE",
+        "connected": 0,
+        "subscribed": 0,
+        "ticks": 0,
+        "history": 0,
+        "error": "",
+        "symbol": "",
+    }
+    for k in INDICES
+}
 
-# =========================================================
+tasks = {}
+
+# ============================================================
+# SYMBOL DATABASE
+# ============================================================
+
+resolved_symbols = {}
+
+symbol_loader_done = False
+symbol_loader_error = ""
+
+
+# ============================================================
 # KEEP ALIVE
-# =========================================================
+# ============================================================
 
 def keep_alive():
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            "10000"
-        )
-    )
+    port = int(os.environ.get("PORT", "10000"))
 
     class H(BaseHTTPRequestHandler):
 
         def do_GET(self):
-
             self.send_response(200)
             self.end_headers()
-
-            self.wfile.write(
-                b"AI MANIAC SYMBOL DIAGNOSTIC ONLINE"
-            )
+            self.wfile.write(b"AI MANGAS V5 FIX - SYMBOL DIAGNOSTIC")
 
         def log_message(self, *args):
             pass
 
-    HTTPServer(
-        ("0.0.0.0", port),
-        H
-    ).serve_forever()
+    HTTPServer(("0.0.0.0", port), H).serve_forever()
 
 
 threading.Thread(
@@ -101,22 +99,625 @@ threading.Thread(
 ).start()
 
 
-# =========================================================
-# GET ACTIVE SYMBOLS FROM DERIV
-# =========================================================
+# ============================================================
+# GET ACTIVE SYMBOLS
+# ============================================================
 
-async def fetch_active_symbols():
+async def load_deriv_symbols():
 
-    global active_symbols_raw
+    global symbol_loader_done
+    global symbol_loader_error
 
-    uri = (
-        f"wss://ws.derivws.com/"
-        f"websockets/v3?app_id={APP_ID}"
+    uri = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+
+    try:
+
+        logging.info("Connecting to Deriv for active_symbols...")
+
+        async with websockets.connect(
+            uri,
+            ping_interval=20,
+            ping_timeout=20,
+            open_timeout=15
+        ) as ws:
+
+            diag_global = "CONNECTED"
+
+            await ws.send(
+                json.dumps({
+                    "active_symbols": "brief",
+                    "product_type": "basic"
+                })
+            )
+
+            raw = await asyncio.wait_for(
+                ws.recv(),
+                timeout=15
+            )
+
+            msg = json.loads(raw)
+
+            logging.info(
+                "Deriv active_symbols response received"
+            )
+
+            if "error" in msg:
+
+                raise RuntimeError(
+                    msg["error"].get(
+                        "message",
+                        "Unknown Deriv error"
+                    )
+                )
+
+            symbols = msg.get("active_symbols")
+
+            if not symbols:
+
+                raise RuntimeError(
+                    "Deriv returned no active_symbols"
+                )
+
+            logging.info(
+                "Deriv returned %s active symbols",
+                len(symbols)
+            )
+
+            # ------------------------------------------------
+            # SEARCH ALL BOOM / CRASH ENTRIES
+            # ------------------------------------------------
+
+            found = []
+
+            for item in symbols:
+
+                if not isinstance(item, dict):
+                    continue
+
+                symbol = (
+                    item.get("underlying_symbol")
+                    or item.get("symbol")
+                    or ""
+                )
+
+                display = (
+                    item.get("underlying_symbol_name")
+                    or item.get("display_name")
+                    or ""
+                )
+
+                symbol_upper = str(symbol).upper()
+                display_upper = str(display).upper()
+
+                if (
+                    "BOOM" in symbol_upper
+                    or "CRASH" in symbol_upper
+                    or "BOOM" in display_upper
+                    or "CRASH" in display_upper
+                ):
+
+                    found.append({
+                        "symbol": symbol,
+                        "display": display,
+                        "raw": item
+                    })
+
+            logging.info(
+                "Boom/Crash candidates found: %s",
+                len(found)
+            )
+
+            # ------------------------------------------------
+            # SAVE EXACT API SYMBOLS
+            # ------------------------------------------------
+
+            for key, info in INDICES.items():
+
+                wanted_name = info["name"].upper()
+
+                candidates = []
+
+                for item in found:
+
+                    symbol = str(
+                        item["symbol"]
+                    ).upper()
+
+                    display = str(
+                        item["display"]
+                    ).upper()
+
+                    # Exact display-name match
+                    if wanted_name == display:
+                        candidates.append(item)
+                        continue
+
+                    # Match index number + Boom/Crash
+                    if key.startswith("BOOM"):
+
+                        if (
+                            "BOOM" in symbol
+                            and key[4:] in symbol
+                        ):
+                            candidates.append(item)
+
+                        elif (
+                            "BOOM" in display
+                            and key[4:] in display
+                        ):
+                            candidates.append(item)
+
+                    elif key.startswith("CRASH"):
+
+                        if (
+                            "CRASH" in symbol
+                            and key[5:] in symbol
+                        ):
+                            candidates.append(item)
+
+                        elif (
+                            "CRASH" in display
+                            and key[5:] in display
+                        ):
+                            candidates.append(item)
+
+                if candidates:
+
+                    # Prefer exact display match
+                    exact = [
+                        x for x in candidates
+                        if str(x["display"]).upper()
+                        == wanted_name
+                    ]
+
+                    selected = (
+                        exact[0]
+                        if exact
+                        else candidates[0]
+                    )
+
+                    real_symbol = selected["symbol"]
+
+                    resolved_symbols[key] = real_symbol
+
+                    diag[key]["symbol"] = real_symbol
+                    diag[key]["stage"] = "SYMBOL"
+                    diag[key]["error"] = ""
+
+                    logging.info(
+                        "%s -> %s",
+                        key,
+                        real_symbol
+                    )
+
+                else:
+
+                    diag[key]["symbol"] = ""
+                    diag[key]["stage"] = "SYMBOL"
+                    diag[key]["error"] = (
+                        "No matching Boom/Crash symbol found"
+                    )
+
+            symbol_loader_done = True
+
+    except Exception as e:
+
+        symbol_loader_error = (
+            f"{type(e).__name__}: {str(e)[:150]}"
+        )
+
+        logging.error(
+            "SYMBOL LOADER ERROR: %s",
+            symbol_loader_error
+        )
+
+        for k in INDICES:
+
+            diag[k]["stage"] = "ERROR"
+            diag[k]["error"] = symbol_loader_error
+
+        symbol_loader_done = False
+
+
+# ============================================================
+# SYMBOL LOADER LOOP
+# ============================================================
+
+async def symbol_loader_loop():
+
+    while True:
+
+        await load_deriv_symbols()
+
+        if resolved_symbols:
+            return
+
+        await asyncio.sleep(10)
+
+
+# ============================================================
+# DERIV HISTORY + LIVE
+# ============================================================
+
+async def deriv_ws(k, app):
+
+    while k in active:
+
+        api_symbol = resolved_symbols.get(k)
+
+        if not api_symbol:
+
+            diag[k]["stage"] = "SYMBOL"
+            diag[k]["connected"] = 0
+            diag[k]["subscribed"] = 0
+            diag[k]["error"] = (
+                "Waiting for real Deriv symbol"
+            )
+
+            await asyncio.sleep(3)
+            continue
+
+        uri = (
+            f"wss://ws.derivws.com/websockets/v3"
+            f"?app_id={APP_ID}"
+        )
+
+        try:
+
+            # =================================================
+            # HISTORY
+            # =================================================
+
+            diag[k]["stage"] = "HISTORY"
+            diag[k]["connected"] = 0
+            diag[k]["subscribed"] = 0
+
+            async with websockets.connect(
+                uri,
+                ping_interval=20,
+                ping_timeout=20,
+                open_timeout=15
+            ) as ws:
+
+                diag[k]["connected"] = 1
+
+                await ws.send(
+                    json.dumps({
+                        "ticks_history": api_symbol,
+                        "count": 5000,
+                        "end": "latest",
+                        "style": "ticks"
+                    })
+                )
+
+                while True:
+
+                    raw = await asyncio.wait_for(
+                        ws.recv(),
+                        timeout=20
+                    )
+
+                    msg = json.loads(raw)
+
+                    if "error" in msg:
+
+                        raise RuntimeError(
+                            msg["error"].get(
+                                "message",
+                                "History error"
+                            )
+                        )
+
+                    history = msg.get("history")
+
+                    if history:
+
+                        prices = history.get(
+                            "prices",
+                            []
+                        )
+
+                        diag[k]["history"] = len(
+                            prices
+                        )
+
+                        ticks[k].clear()
+
+                        for price in prices[-500:]:
+
+                            ticks[k].append(
+                                (
+                                    time.time(),
+                                    float(price)
+                                )
+                            )
+
+                        break
+
+            # =================================================
+            # LIVE TICKS
+            # =================================================
+
+            diag[k]["stage"] = "LIVE"
+
+            async with websockets.connect(
+                uri,
+                ping_interval=20,
+                ping_timeout=20,
+                open_timeout=15
+            ) as ws:
+
+                diag[k]["connected"] = 1
+
+                await ws.send(
+                    json.dumps({
+                        "ticks": api_symbol,
+                        "subscribe": 1
+                    })
+                )
+
+                async for raw in ws:
+
+                    msg = json.loads(raw)
+
+                    if "error" in msg:
+
+                        raise RuntimeError(
+                            msg["error"].get(
+                                "message",
+                                "Live tick error"
+                            )
+                        )
+
+                    tick = msg.get("tick")
+
+                    if not isinstance(tick, dict):
+                        continue
+
+                    quote = tick.get("quote")
+
+                    if quote is None:
+                        continue
+
+                    epoch = tick.get(
+                        "epoch",
+                        time.time()
+                    )
+
+                    diag[k]["subscribed"] = 1
+                    diag[k]["ticks"] += 1
+
+                    ticks[k].append(
+                        (
+                            float(epoch),
+                            float(quote)
+                        )
+                    )
+
+        except asyncio.CancelledError:
+
+            return
+
+        except Exception as e:
+
+            diag[k]["stage"] = "ERROR"
+            diag[k]["connected"] = 0
+            diag[k]["subscribed"] = 0
+
+            diag[k]["error"] = (
+                f"{type(e).__name__}: "
+                f"{str(e)[:150]}"
+            )
+
+            logging.error(
+                "%s ERROR: %s",
+                k,
+                diag[k]["error"]
+            )
+
+            await asyncio.sleep(5)
+
+
+# ============================================================
+# BUTTONS
+# ============================================================
+
+def buttons():
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"{'🟢' if k in active else '⚪'} "
+                    f"{v['name']}",
+                    callback_data=k
+                )
+            ]
+            for k, v in INDICES.items()
+        ]
     )
 
-    api_status["stage"] = "CONNECTING"
-    api_status["connected"] = 0
-    api_status["error"] = ""
+
+# ============================================================
+# START
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    chat_ids.add(
+        update.effective_chat.id
+    )
+
+    for k in INDICES:
+
+        active.add(k)
+
+        if (
+            k not in tasks
+            or tasks[k].done()
+        ):
+
+            tasks[k] = asyncio.create_task(
+                deriv_ws(
+                    k,
+                    context.application
+                )
+            )
+
+    await update.message.reply_text(
+        "👹🧠 AI МАНГАС V5 FIX\n\n"
+        "7 BOOM / CRASH INDEX\n"
+        "Symbol resolution + Live tick ON",
+        reply_markup=buttons()
+    )
+
+
+# ============================================================
+# BUTTON
+# ============================================================
+
+async def button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    q = update.callback_query
+
+    await q.answer()
+
+    k = q.data
+
+    if k in active:
+
+        active.remove(k)
+
+        task = tasks.get(k)
+
+        if task:
+            task.cancel()
+
+    else:
+
+        active.add(k)
+
+        tasks[k] = asyncio.create_task(
+            deriv_ws(
+                k,
+                context.application
+            )
+        )
+
+    try:
+
+        await q.edit_message_reply_markup(
+            reply_markup=buttons()
+        )
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+async def status(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat_ids.add(
+        update.effective_chat.id
+    )
+
+    for k in INDICES:
+
+        info = INDICES[k]
+
+        symbol = (
+            resolved_symbols.get(k)
+            or "NOT RESOLVED"
+        )
+
+        text = (
+            f"{'🟢' if k in active else '⚪'} "
+            f"{info['name']}\n"
+            f"API Symbol: {symbol}\n"
+            f"Stage: {diag[k]['stage']}\n"
+            f"WS: "
+            f"{'ON ✅' if diag[k]['connected'] else 'OFF ❌'}\n"
+            f"Sub: "
+            f"{'YES ✅' if diag[k]['subscribed'] else 'NO ❌'}\n"
+            f"Live ticks: {diag[k]['ticks']}\n"
+            f"History: {diag[k]['history']}\n"
+            f"Err: {diag[k]['error']}\n"
+        )
+
+        await update.message.reply_text(text)
+
+
+# ============================================================
+# SYMBOLS
+# ============================================================
+
+async def symbols(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat_ids.add(
+        update.effective_chat.id
+    )
+
+    lines = [
+        "👹🧠 AI МАНГАС V5 FIX",
+        "",
+        "DERIV API SYMBOL STATUS",
+        ""
+    ]
+
+    for k, info in INDICES.items():
+
+        symbol = (
+            resolved_symbols.get(k)
+            or "NOT RESOLVED"
+        )
+
+        lines.append(
+            f"{'🟢' if symbol != 'NOT RESOLVED' else '⚪'} "
+            f"{info['name']}\n"
+            f"API Symbol: {symbol}\n"
+        )
+
+    if symbol_loader_error:
+
+        lines.append(
+            f"\nLoader error:\n"
+            f"{symbol_loader_error}"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# RAW SYMBOL DIAGNOSTIC
+# ============================================================
+
+async def raw_symbols(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat_ids.add(
+        update.effective_chat.id
+    )
+
+    uri = (
+        f"wss://ws.derivws.com/websockets/v3"
+        f"?app_id={APP_ID}"
+    )
 
     try:
 
@@ -124,339 +725,163 @@ async def fetch_active_symbols():
             uri,
             ping_interval=20,
             ping_timeout=20,
-            open_timeout=15,
-            close_timeout=5
+            open_timeout=15
         ) as ws:
-
-            api_status["connected"] = 1
-            api_status["stage"] = "REQUEST"
 
             await ws.send(
                 json.dumps({
-                    "active_symbols": "brief"
+                    "active_symbols": "brief",
+                    "product_type": "basic"
                 })
             )
 
             raw = await asyncio.wait_for(
                 ws.recv(),
-                timeout=20
+                timeout=15
             )
 
             msg = json.loads(raw)
 
             if "error" in msg:
 
-                raise RuntimeError(
-                    msg["error"].get(
-                        "message",
-                        "Deriv API error"
+                await update.message.reply_text(
+                    "❌ DERIV ERROR\n\n"
+                    + str(msg["error"])
+                )
+                return
+
+            symbols_data = msg.get(
+                "active_symbols",
+                []
+            )
+
+            lines = [
+                "🔎 RAW DERIV BOOM / CRASH SYMBOLS",
+                ""
+            ]
+
+            for item in symbols_data:
+
+                if not isinstance(item, dict):
+                    continue
+
+                symbol = (
+                    item.get("underlying_symbol")
+                    or item.get("symbol")
+                    or ""
+                )
+
+                display = (
+                    item.get("underlying_symbol_name")
+                    or item.get("display_name")
+                    or ""
+                )
+
+                s = str(symbol).upper()
+                d = str(display).upper()
+
+                if (
+                    "BOOM" in s
+                    or "CRASH" in s
+                    or "BOOM" in d
+                    or "CRASH" in d
+                ):
+
+                    lines.append(
+                        f"SYMBOL: {symbol}\n"
+                        f"NAME: {display}\n"
                     )
+
+            if len(lines) == 2:
+
+                lines.append(
+                    "❌ Boom/Crash symbol олдсонгүй."
                 )
 
-            if not msg.get("active_symbols"):
-
-                raise RuntimeError(
-                    "Deriv returned no active_symbols"
-                )
-
-            active_symbols_raw = (
-                msg["active_symbols"]
+            await update.message.reply_text(
+                "\n".join(lines)
             )
-
-            api_status["stage"] = "READY"
-
-            logging.info(
-                "Received %d active symbols",
-                len(active_symbols_raw)
-            )
-
-            return True
 
     except Exception as e:
 
-        api_status["stage"] = "ERROR"
-        api_status["connected"] = 0
-        api_status["error"] = (
-            f"{type(e).__name__}: "
-            f"{str(e)[:200]}"
+        await update.message.reply_text(
+            "❌ DERIV API ERROR\n\n"
+            f"{type(e).__name__}: {str(e)}"
         )
 
-        logging.error(
-            "Deriv symbol diagnostic error: %s",
-            api_status["error"]
-        )
 
-        return False
+# ============================================================
+# AUTO START
+# ============================================================
 
+async def auto_start(app):
 
-# =========================================================
-# FILTER BOOM / CRASH
-# =========================================================
+    # Telegram-ийг block хийхгүй.
+    # Symbol loader background-д ажиллана.
 
-def get_boom_crash_symbols():
-
-    results = []
-
-    for item in active_symbols_raw:
-
-        symbol = str(
-            item.get(
-                "symbol",
-                ""
-            )
-        )
-
-        display_name = str(
-            item.get(
-                "display_name",
-                ""
-            )
-        )
-
-        underlying_symbol = str(
-            item.get(
-                "underlying_symbol",
-                ""
-            )
-        )
-
-        underlying_name = str(
-            item.get(
-                "underlying_symbol_name",
-                ""
-            )
-        )
-
-        combined = (
-            f"{symbol} "
-            f"{display_name} "
-            f"{underlying_symbol} "
-            f"{underlying_name}"
-        ).lower()
-
-        if (
-            "boom" in combined
-            or
-            "crash" in combined
-        ):
-
-            results.append({
-                "symbol": symbol,
-                "display_name": display_name,
-                "underlying_symbol": underlying_symbol,
-                "underlying_symbol_name": underlying_name,
-            })
-
-    return results
-
-
-# =========================================================
-# /symbols
-# =========================================================
-
-async def symbols(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-        "🔎 Deriv API symbol шалгаж байна..."
+    asyncio.create_task(
+        symbol_loader_loop()
     )
 
-    ok = await fetch_active_symbols()
+    # Symbol олдсоны дараа live connections эхлүүлнэ.
 
-    if not ok:
+    async def start_connections():
 
-        await update.message.reply_text(
-            "❌ DERIV API SYMBOL ERROR\n\n"
-            f"Stage: {api_status['stage']}\n"
-            f"WS: "
-            f"{'ON ✅' if api_status['connected'] else 'OFF ❌'}\n"
-            f"Error: {api_status['error']}"
-        )
+        while not resolved_symbols:
 
-        return
+            await asyncio.sleep(1)
 
-    results = get_boom_crash_symbols()
+        for k in INDICES:
 
-    if not results:
+            active.add(k)
 
-        await update.message.reply_text(
-            "❌ BOOM / CRASH SYMBOL ОЛДСОНГҮЙ.\n\n"
-            f"Total active symbols: "
-            f"{len(active_symbols_raw)}\n"
-            f"API stage: {api_status['stage']}"
-        )
-
-        return
-
-    # Telegram message length limit хамгаалалт
-    lines = [
-        "📡 DERIV RAW BOOM / CRASH SYMBOLS",
-        "",
-        f"Total API symbols: {len(active_symbols_raw)}",
-        f"Boom/Crash found: {len(results)}",
-        ""
-    ]
-
-    for i, item in enumerate(
-        results,
-        start=1
-    ):
-
-        lines.append(
-            f"{i}. "
-            f"symbol = {item['symbol']}"
-        )
-
-        lines.append(
-            f"   display = "
-            f"{item['display_name']}"
-        )
-
-        lines.append(
-            f"   underlying = "
-            f"{item['underlying_symbol']}"
-        )
-
-        lines.append(
-            f"   underlying_name = "
-            f"{item['underlying_symbol_name']}"
-        )
-
-        lines.append("")
-
-    text = "\n".join(lines)
-
-    # Telegram 4096 character limit
-    if len(text) <= 4000:
-
-        await update.message.reply_text(
-            text
-        )
-
-    else:
-
-        # Хэсэгчилж илгээнэ
-        chunk = ""
-
-        for line in lines:
-
-            if len(chunk) + len(line) + 1 > 3800:
-
-                await update.message.reply_text(
-                    chunk
+            tasks[k] = asyncio.create_task(
+                deriv_ws(
+                    k,
+                    app
                 )
-
-                chunk = ""
-
-            chunk += line + "\n"
-
-        if chunk:
-
-            await update.message.reply_text(
-                chunk
             )
 
-
-# =========================================================
-# /symbol
-# =========================================================
-
-async def symbol(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await symbols(
-        update,
-        context
+    asyncio.create_task(
+        start_connections()
     )
 
 
-# =========================================================
-# /status
-# =========================================================
-
-async def status(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-        "🧠 AI MANIAC SYMBOL DIAGNOSTIC\n\n"
-        f"API Stage: {api_status['stage']}\n"
-        f"WS: "
-        f"{'ON ✅' if api_status['connected'] else 'OFF ❌'}\n"
-        f"Active symbols loaded: "
-        f"{len(active_symbols_raw)}\n"
-        f"Error: "
-        f"{api_status['error'] or 'NONE'}"
-    )
-
-
-# =========================================================
-# /start
-# =========================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-        "🧠🔥 AI MANIAC V5 FIX\n\n"
-        "SYMBOL DIAGNOSTIC MODE\n\n"
-        "Командууд:\n"
-        "/symbols - Deriv-ийн бодит Boom/Crash symbol\n"
-        "/symbol - ижил\n"
-        "/status - API status"
-    )
-
-
-# =========================================================
-# APPLICATION
-# =========================================================
+# ============================================================
+# TELEGRAM APP
+# ============================================================
 
 app = (
     ApplicationBuilder()
     .token(TOKEN)
+    .post_init(auto_start)
     .build()
 )
 
-
 app.add_handler(
-    CommandHandler(
-        "start",
-        start
-    )
+    CommandHandler("start", start)
 )
 
 app.add_handler(
-    CommandHandler(
-        "symbols",
-        symbols
-    )
+    CommandHandler("status", status)
 )
 
 app.add_handler(
-    CommandHandler(
-        "symbol",
-        symbol
-    )
+    CommandHandler("symbols", symbols)
 )
 
 app.add_handler(
-    CommandHandler(
-        "status",
-        status
-    )
+    CommandHandler("rawsymbols", raw_symbols)
+)
+
+app.add_handler(
+    CallbackQueryHandler(button)
 )
 
 
-# =========================================================
+# ============================================================
 # RUN
-# =========================================================
+# ============================================================
 
 if __name__ == "__main__":
 
