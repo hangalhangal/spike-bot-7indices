@@ -444,86 +444,164 @@ def calculate_volatility(prices, period=20):
 
 
 # ============================================================
-# ADX / DMI — FIX V2
+# ADX / DMI — V3
 # ============================================================
 #
-# IMPORTANT:
-# Энэ нь candle OHLC биш tick data дээр ажиллаж байгаа
-# тул стандарт Forex ADX-ийн яг хуулбар биш.
+# Tick data-гаас synthetic OHLC candles үүсгэнэ.
 #
-# Өмнөх хувилбар:
-#   - сүүлийн 29 tick дээр шууд +DM/-DM
-#   - нэг чиглэлийн tick давамгайлахад
-#     +DI 100 / -DI 0 эсвэл эсрэгээрээ
-#   - ADX 100 болж хэт туйлширч байсан.
+# 5 tick = 1 synthetic candle.
 #
-# Шинэ хувилбар:
-#   - илүү урт tick window ашиглана
-#   - directional movement-ийг зөөлрүүлнэ
-#   - rolling DX-ийг ашиглана
-#   - ADX болон DI-г хэт туйлширсан 0/100 утгаас хамгаална
+# Дараа нь стандарт ADX/DMI-ийн үндсэн зарчмыг ашиглана:
+#   TR
+#   +DM
+#   -DM
+#   Wilder smoothing
+#   +DI
+#   -DI
+#   DX
+#   ADX
 #
-# БУСАД ЛОГИКТ ХҮРЭХГҮЙ.
+# Artificial 5/95 болон 80 clamp байхгүй.
 # ============================================================
 
 def calculate_adx_dmi(prices, period=14):
 
-    minimum_needed = period * 4 + 1
+    TICKS_PER_CANDLE = 5
+
+    minimum_candles = (
+        period * 3 + 5
+    )
+
+    minimum_needed = (
+        minimum_candles
+        * TICKS_PER_CANDLE
+    )
 
     if len(prices) < minimum_needed:
         return None
 
-    recent = prices[-(period * 4 + 1):]
+    recent_prices = prices[
+        -minimum_needed:
+    ]
+
+    candles = []
+
+    index = 0
+
+    while (
+        index + TICKS_PER_CANDLE
+        <= len(recent_prices)
+    ):
+
+        chunk = recent_prices[
+            index:
+            index + TICKS_PER_CANDLE
+        ]
+
+        if len(chunk) < TICKS_PER_CANDLE:
+            break
+
+        candle_open = chunk[0]
+        candle_high = max(chunk)
+        candle_low = min(chunk)
+        candle_close = chunk[-1]
+
+        candles.append({
+            "open": candle_open,
+            "high": candle_high,
+            "low": candle_low,
+            "close": candle_close,
+        })
+
+        index += TICKS_PER_CANDLE
+
+    if len(candles) < period * 2 + 2:
+        return None
 
     tr_values = []
     plus_dm_values = []
     minus_dm_values = []
 
-    for i in range(1, len(recent)):
+    for i in range(1, len(candles)):
 
-        current = recent[i]
-        previous = recent[i - 1]
+        current = candles[i]
+        previous = candles[i - 1]
 
-        movement = (
-            current - previous
+        current_high = current["high"]
+        current_low = current["low"]
+
+        previous_high = previous["high"]
+        previous_low = previous["low"]
+        previous_close = previous["close"]
+
+        true_range = max(
+            current_high - current_low,
+            abs(
+                current_high
+                - previous_close
+            ),
+            abs(
+                current_low
+                - previous_close
+            ),
         )
 
-        tr = abs(movement)
+        up_move = (
+            current_high
+            - previous_high
+        )
 
-        plus_dm = 0.0
-        minus_dm = 0.0
+        down_move = (
+            previous_low
+            - current_low
+        )
 
-        if movement > 0:
-            plus_dm = movement
+        if (
+            up_move > down_move
+            and up_move > 0
+        ):
+            plus_dm = up_move
+        else:
+            plus_dm = 0.0
 
-        elif movement < 0:
-            minus_dm = abs(movement)
+        if (
+            down_move > up_move
+            and down_move > 0
+        ):
+            minus_dm = down_move
+        else:
+            minus_dm = 0.0
 
-        tr_values.append(tr)
-        plus_dm_values.append(plus_dm)
-        minus_dm_values.append(minus_dm)
+        tr_values.append(
+            true_range
+        )
 
-    if len(tr_values) < period:
+        plus_dm_values.append(
+            plus_dm
+        )
+
+        minus_dm_values.append(
+            minus_dm
+        )
+
+    if len(tr_values) < period * 2:
         return None
 
     # --------------------------------------------------------
-    # Wilder-style smoothing
+    # Initial Wilder averages
     # --------------------------------------------------------
 
-    atr = (
-        sum(tr_values[:period])
-        / period
-    )
+    atr = sum(
+        tr_values[:period]
+    ) / period
 
-    plus_dm_avg = (
-        sum(plus_dm_values[:period])
-        / period
-    )
+    plus_dm_avg = sum(
+        plus_dm_values[:period]
+    ) / period
 
-    minus_dm_avg = (
-        sum(minus_dm_values[:period])
-        / period
-    )
+    minus_dm_avg = sum(
+        minus_dm_values[:period]
+    ) / period
 
     dx_values = []
 
@@ -559,11 +637,7 @@ def calculate_adx_dmi(prices, period=14):
             + minus_dm_values[i]
         ) / period
 
-        if atr <= 0:
-            plus_di = 0.0
-            minus_di = 0.0
-
-        else:
+        if atr > 0:
 
             plus_di = (
                 100.0
@@ -577,17 +651,10 @@ def calculate_adx_dmi(prices, period=14):
                 / atr
             )
 
-            # Tick data дээр DI хэт 0/100
-            # болохоос хамгаална.
-            plus_di = max(
-                5.0,
-                min(95.0, plus_di)
-            )
+        else:
 
-            minus_di = max(
-                5.0,
-                min(95.0, minus_di)
-            )
+            plus_di = 0.0
+            minus_di = 0.0
 
         denominator = (
             plus_di
@@ -607,30 +674,45 @@ def calculate_adx_dmi(prices, period=14):
 
             dx_values.append(dx)
 
-    if len(dx_values) < 3:
+    if len(dx_values) < period:
         return None
 
     # --------------------------------------------------------
-    # ADX smoothing
+    # Wilder ADX
     # --------------------------------------------------------
-
-    adx_window = min(
-        period,
-        len(dx_values)
-    )
 
     adx = (
         sum(
-            dx_values[-adx_window:]
+            dx_values[:period]
         )
-        / adx_window
+        / period
     )
 
-    # Tick-based ADX-ийн хэт туйлшралыг
-    # хамгаалах дээд хязгаар.
+    for dx in dx_values[period:]:
+
+        adx = (
+            (
+                adx
+                * (period - 1)
+            )
+            + dx
+        ) / period
+
+    # Safety only for numerical floating point.
+    # No artificial trading clamp.
+    plus_di = max(
+        0.0,
+        min(100.0, plus_di)
+    )
+
+    minus_di = max(
+        0.0,
+        min(100.0, minus_di)
+    )
+
     adx = max(
         0.0,
-        min(80.0, adx)
+        min(100.0, adx)
     )
 
     return {
