@@ -27,8 +27,7 @@ if not TOKEN:
 # ============================================================
 # AI МАНГАС V5 FIX
 # STEP 4 — FEATURE + PRICE ACTION + MARKET STRUCTURE
-# MOVE STRENGTH FIX
-# EXACT 7 BOOM / CRASH INDEX
+# MARKET STRUCTURE CLASSIFICATION FIX
 # ============================================================
 
 DERIV_PUBLIC_WS = (
@@ -63,7 +62,6 @@ TICK_BUFFER = 5000
 SWING_LEFT = 5
 SWING_RIGHT = 5
 
-# Move Strength uses only recent movement.
 MOVE_STRENGTH_LOOKBACK = 20
 
 
@@ -539,6 +537,11 @@ def calculate_market_structure(symbol):
 
     current_price = prices[-1]
 
+
+    # ========================================================
+    # COMPARE SWING HIGH / LOW
+    # ========================================================
+
     high_is_higher = (
         latest_high > previous_high
     )
@@ -555,44 +558,42 @@ def calculate_market_structure(symbol):
         latest_low < previous_low
     )
 
-    if high_is_higher and low_is_higher:
+
+    # ========================================================
+    # CORRECT MARKET STRUCTURE CLASSIFICATION
+    # ========================================================
+
+    if (
+        high_is_higher
+        and low_is_higher
+    ):
 
         structure_name = "HH + HL"
 
-    elif high_is_lower and low_is_lower:
+    elif (
+        high_is_lower
+        and low_is_lower
+    ):
 
         structure_name = "LH + LL"
 
-    elif high_is_higher:
+    elif (
+        high_is_higher
+        and low_is_lower
+    ):
 
-        structure_name = "HH"
+        structure_name = "HH + LL"
 
-    elif low_is_higher:
+    elif (
+        high_is_lower
+        and low_is_higher
+    ):
 
-        structure_name = "HL"
-
-    elif high_is_lower:
-
-        structure_name = "LH"
-
-    elif low_is_lower:
-
-        structure_name = "LL"
+        structure_name = "LH + HL"
 
     else:
 
         structure_name = "RANGE"
-
-
-    bullish_structure = (
-        high_is_higher
-        and low_is_higher
-    )
-
-    bearish_structure = (
-        high_is_lower
-        and low_is_lower
-    )
 
 
     # ========================================================
@@ -601,17 +602,11 @@ def calculate_market_structure(symbol):
 
     bos = "NONE"
 
-    if (
-        current_price > latest_high
-        and latest_high_index < len(prices) - 1
-    ):
+    if current_price > latest_high:
 
         bos = "BULLISH"
 
-    elif (
-        current_price < latest_low
-        and latest_low_index < len(prices) - 1
-    ):
+    elif current_price < latest_low:
 
         bos = "BEARISH"
 
@@ -622,15 +617,21 @@ def calculate_market_structure(symbol):
 
     choch = "NONE"
 
-    if bearish_structure:
+    if (
+        high_is_lower
+        and low_is_lower
+        and current_price > latest_high
+    ):
 
-        if current_price > latest_high:
-            choch = "BULLISH"
+        choch = "BULLISH"
 
-    elif bullish_structure:
+    elif (
+        high_is_higher
+        and low_is_higher
+        and current_price < latest_low
+    ):
 
-        if current_price < latest_low:
-            choch = "BEARISH"
+        choch = "BEARISH"
 
 
     # ========================================================
@@ -642,15 +643,7 @@ def calculate_market_structure(symbol):
 
 
     # ========================================================
-    # MOVE STRENGTH — FIX
-    #
-    # Only measure the recent 20-tick movement.
-    # Do NOT use the distance to an old swing.
-    #
-    # Result:
-    # 1.0  = movement approximately equal to ATR
-    # 2.0  = approximately 2 ATR
-    # 0.5  = approximately half ATR
+    # MOVE STRENGTH
     # ========================================================
 
     atr = features[symbol]["atr14"]
@@ -1127,8 +1120,8 @@ async def start(
     await update.message.reply_text(
         "👹🧠 AI МАНГАС V5 FIX\n\n"
         "7 INDEX LIVE + FEATURE ENGINE ✅\n"
-        "MARKET STRUCTURE ON ✅\n\n"
-        "Move Strength FIX ON ✅\n\n"
+        "MARKET STRUCTURE ON ✅\n"
+        "STRUCTURE CLASSIFICATION FIX ON ✅\n\n"
         "History → Live Tick → Features → Structure\n\n"
         "/status"
     )
@@ -1315,7 +1308,7 @@ async def rawstatus(
         f"Active workers: "
         f"{len(active)}/7\n\n"
         "FEATURE + MARKET STRUCTURE MODE\n"
-        "MOVE STRENGTH FIX ON"
+        "STRUCTURE CLASSIFICATION FIX ON"
     )
 
 
