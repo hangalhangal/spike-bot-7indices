@@ -1,29 +1,27 @@
-import os,json,time,math,asyncio,logging,threading
+import os,json,time,asyncio,logging,threading
 from http.server import BaseHTTPRequestHandler,HTTPServer
 from collections import deque
 import websockets
 from telegram import Update,InlineKeyboardButton,InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder,CommandHandler,CallbackQueryHandler,ContextTypes
 
-logging.basicConfig(level=logging.INFO,format="%(asctime)s %(message)s")
+logging.basicConfig(level=logging.INFO)
 TOKEN=os.getenv("TELEGRAM_TOKEN")
 if not TOKEN: raise RuntimeError("TELEGRAM_TOKEN missing")
 
 INDICES={
-"BOOM1000":{"name":"Boom 1000 Index"},
-"BOOM500":{"name":"Boom 500 Index"},
-"BOOM600":{"name":"Boom 600 Index"},
-"BOOM900":{"name":"Boom 900 Index"},
-"CRASH1000":{"name":"Crash 1000 Index"},
-"CRASH500":{"name":"Crash 500 Index"},
-"CRASH900":{"name":"Crash 900 Index"},
+"BOOM1000":{"name":"Boom 1000"},
+"BOOM500":{"name":"Boom 500"},
+"BOOM600":{"name":"Boom 600"},
+"BOOM900":{"name":"Boom 900"},
+"CRASH1000":{"name":"Crash 1000"},
+"CRASH500":{"name":"Crash 500"},
+"CRASH900":{"name":"Crash 900"},
 }
 APP_ID=os.getenv("DERIV_APP_ID","1089")
-LIVE_HISTORY=500; WARMUP=5000
 
 active=set(); chat_ids=set()
-ticks={k:deque(maxlen=LIVE_HISTORY) for k in INDICES}
-hist={k:[] for k in INDICES}
+ticks={k:deque(maxlen=500) for k in INDICES}
 diag={k:{"ticks":0,"history":0,"connected":0,"subscribed":0,"stage":"IDLE","error":""} for k in INDICES}
 tasks={}
 
@@ -34,16 +32,18 @@ async def deriv_ws(k,app):
             async with websockets.connect(uri,ping_interval=20,ping_timeout=20) as ws:
                 diag[k]["stage"]="HISTORY"
                 diag[k]["connected"]=1
-                await ws.send(json.dumps({"ticks_history":k,"count":WARMUP,"style":"ticks"}))
+                # FIX V58 - END ГЭЖ ЮУ Ч БАЙХГҮЙ!
+                await ws.send(json.dumps({"ticks_history":k,"count":5000,"style":"ticks"}))
                 async for raw in ws:
                     msg=json.loads(raw)
                     if "error" in msg: raise RuntimeError(msg["error"]["message"])
                     if msg.get("history"):
-                        h=msg["history"]; ps=h.get("prices",[]); ts=h.get("times",[])
-                        hist[k]=[(float(ts[i]),float(x)) for i,x in enumerate(ps) if i<len(ts)]
+                        h=msg["history"]
+                        ps=h.get("prices",[]); ts=h.get("times",[])
+                        diag[k]["history"]=len(ps)
                         ticks[k].clear()
-                        for item in hist[k][-LIVE_HISTORY:]: ticks[k].append(item)
-                        diag[k]["history"]=len(hist[k])
+                        for i in range(max(0,len(ps)-500),len(ps)):
+                            ticks[k].append((float(ts[i]),float(ps[i])))
                         break
             async with websockets.connect(uri,ping_interval=20,ping_timeout=20) as ws:
                 diag[k]["stage"]="LIVE"
@@ -56,11 +56,11 @@ async def deriv_ws(k,app):
                     if t:
                         diag[k]["subscribed"]=1
                         diag[k]["ticks"]+=1
-                        diag[k]["last_tick"]=time.time()
                         ticks[k].append((float(t.get("epoch",time.time())),float(t["quote"])))
-        except asyncio.CancelledError: return
+        except asyncio.CancelledError:
+            return
         except Exception as e:
-            diag[k]["error"]=str(e)
+            diag[k]["error"]=str(e)[:100]
             diag[k]["stage"]="ERROR"
             diag[k]["connected"]=0
             diag[k]["subscribed"]=0
@@ -69,7 +69,7 @@ async def deriv_ws(k,app):
 def keep_alive():
     port=int(os.environ.get("PORT","10000"))
     class H(BaseHTTPRequestHandler):
-        def do_GET(self): self.send_response(200);self.end_headers();self.wfile.write(b"V57 LIVE")
+        def do_GET(self): self.send_response(200);self.end_headers();self.wfile.write(b"V58 LIVE NO END")
         def log_message(self,*a): pass
     HTTPServer(("0.0.0.0",port),H).serve_forever()
 threading.Thread(target=keep_alive,daemon=True).start()
@@ -83,7 +83,7 @@ async def start(update,context):
         active.add(k)
         if k not in tasks or tasks[k].done():
             tasks[k]=asyncio.create_task(deriv_ws(k,context.application))
-    await update.message.reply_text("V57 LIVE FIXED - 7 INDEX\nHistory OK, LIVE OK",reply_markup=buttons())
+    await update.message.reply_text("V58 LIVE FIXED - NO END - 7 INDEX",reply_markup=buttons())
 
 async def button(update,context):
     q=update.callback_query;await q.answer();k=q.data
@@ -99,15 +99,14 @@ async def button(update,context):
 
 async def status(update,context):
     chat_ids.add(update.effective_chat.id)
-    await update.message.reply_text(f"ACTIVE {len(active)}/7")
+    await update.message.reply_text(f"ACTIVE {len(active)}/7 V58 NO END")
     for k in INDICES:
         d=diag[k]
-        txt=f"{k} Stage {d['stage']} WS {'ON' if d['connected'] else 'OFF'} Sub {'YES' if d['subscribed'] else 'NO'} Live {d['ticks']} Hist {d['history']} Err {d['error']}"
-        await update.message.reply_text(txt)
+        await update.message.reply_text(f"{k} Stage {d['stage']} WS {'ON' if d['connected'] else 'OFF'} Sub {'YES' if d['subscribed'] else 'NO'} Live {d['ticks']} Hist {d['history']} Err {d['error']}")
 
 async def symbols(update,context):
     chat_ids.add(update.effective_chat.id)
-    await update.message.reply_text("\n".join([f"{k}: {k}" for k in INDICES]))
+    await update.message.reply_text("\n".join([k for k in INDICES]))
 
 async def auto_start(app):
     for k in INDICES:
