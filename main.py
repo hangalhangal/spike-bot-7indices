@@ -424,6 +424,24 @@ async def rawstatus(
 
 
 # ============================================================
+# STATUS
+# ============================================================
+# /status нь /rawstatus-тэй ижил оношилгоог харуулна.
+# ЗӨВХӨН ЭНЭ COMMAND-ИЙГ НЭМСЭН.
+# ============================================================
+
+async def status(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await rawstatus(
+        update,
+        context
+    )
+
+
+# ============================================================
 # START
 # ============================================================
 
@@ -436,7 +454,9 @@ async def start(
         "👹🧠 AI МАНГАС V5 FIX\n\n"
         "NEW DERIV PUBLIC API diagnostic "
         "ажиллаж байна.\n\n"
-        "Одоо /debugsymbols явуул."
+        "/status — API status\n"
+        "/debugsymbols — 7 Boom/Crash symbol шалгах\n"
+        "/rawstatus — raw API status"
     )
 
 
@@ -466,6 +486,13 @@ app.add_handler(
     CommandHandler(
         "start",
         start
+    )
+)
+
+app.add_handler(
+    CommandHandler(
+        "status",
+        status
     )
 )
 
