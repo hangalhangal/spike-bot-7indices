@@ -98,6 +98,10 @@ history_trained = set()
 
 diagnostics = {}
 
+# Latest model probabilities for diagnostics
+last_probabilities = {k: [1.0/CLASS_COUNT] * CLASS_COUNT for k in INDICES}
+last_predicted_class = {k: 0 for k in INDICES}
+
 for key in INDICES:
     models[key] = {
         "weights": [[0.0] * FEATURE_COUNT for _ in range(CLASS_COUNT)],
@@ -322,7 +326,7 @@ def warmup_model(key):
             if label is not None: train_model(key,f,label); trained+=1
         i+=step
     history_trained.add(key); save_memory()
-    logging.info("%s V4 warm-up +%d samples, total=%d",key,trained,models[key]["samples"])
+    logging.info("%s V5 warm-up +%d samples, total=%d",key,trained,models[key]["samples"])
 
 # ============================================================
 # HISTORICAL WARM-UP
@@ -545,6 +549,8 @@ async def deriv_ws(symbol, key, app):
                     key,
                     features
                 )
+                last_probabilities[key] = probabilities
+                last_predicted_class[key] = predicted_class
                 diagnostics[key]["last_confidence"] = confidence
                 if predicted_class != 0:
                     diagnostics[key]["candidates"] += 1
@@ -604,7 +610,7 @@ def keep_alive():
         def do_GET(self):
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b"AI MANIAC V3 LIVE")
+            self.wfile.write(b"AI MANIAC V5 LIVE")
 
         def log_message(self, *args):
             return
@@ -655,7 +661,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🧠 AI historical data-аар warm-up хийнэ.\n"
         "🔄 Шинэ prediction бүрийн дараа өөрийгөө шинэчилнэ.\n"
         "💾 Сурсан жинг memory-д хадгална.\n"
-        "🎯 Зөвхөн 85%+ model confidence үед Telegram signal.\n\n"
+        "🎯 Diagnostic signal threshold: 40%.\n\n"
         "⚠️ Эхлээд суралцана. Шууд ашиг амлахгүй.",
         reply_markup=index_buttons(),
     )
@@ -729,6 +735,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"WIN: {ok} | LOSS: {fail}\n"
             f"WinRate: {wr:.1f}%\n"
             f"Pending: {len(pending_predictions[key])} | Candidates: {diagnostics[key]['candidates']}\n"
+            f"Prob UP: {last_probabilities[key][1]*100:.1f}% | DOWN: {last_probabilities[key][2]*100:.1f}% | NO SPIKE: {last_probabilities[key][0]*100:.1f}%\n"
             f"Signals: {diagnostics[key]['signals']} | Errors: {diagnostics[key]['errors']}\n\n"
         )
 
@@ -737,7 +744,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🟢 Active: {len(active)}/7\n"
         "🧠 Online learning: ON\n"
         "💾 Persistent memory: ON\n"
-        "🎯 Adaptive confidence: 75–80%\n"
+        "🎯 Diagnostic confidence: 40%\n"
         "⚠️ WinRate нь бодит үр дүнгээр тооцогдоно."
     )
 
@@ -783,7 +790,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Historical warm-up: ON ✅\n"
         "Online learning: ON ✅\n"
         "Persistent memory: ON ✅\n"
-        "Adaptive 75–80% signal filter: ON ✅\n"
+        "Diagnostic 40% signal filter: ON ✅\n"
         "Auto /start activation: ON ✅\n\n"
         "⚠️ TEST MESSAGE ONLY"
     )
