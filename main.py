@@ -27,7 +27,8 @@ if not TOKEN:
 # ============================================================
 # AI МАНГАС V5 FIX
 # STEP 4 — FEATURE + PRICE ACTION + MARKET STRUCTURE
-# MARKET STRUCTURE CLASSIFICATION FIX
+# MOVE STRENGTH NORMALIZATION FIX
+# EXACT 7 BOOM / CRASH INDEX
 # ============================================================
 
 DERIV_PUBLIC_WS = (
@@ -560,7 +561,7 @@ def calculate_market_structure(symbol):
 
 
     # ========================================================
-    # CORRECT MARKET STRUCTURE CLASSIFICATION
+    # MARKET STRUCTURE CLASSIFICATION
     # ========================================================
 
     if (
@@ -643,7 +644,20 @@ def calculate_market_structure(symbol):
 
 
     # ========================================================
-    # MOVE STRENGTH
+    # MOVE STRENGTH — NORMALIZED FIX
+    #
+    # Previous:
+    # recent_move / ATR
+    #
+    # Problem:
+    # 20 ticks can accumulate a large multiple of ATR.
+    #
+    # New:
+    # recent_move /
+    # (ATR * sqrt(lookback))
+    #
+    # This normalizes the movement relative to the
+    # expected volatility over the lookback window.
     # ========================================================
 
     atr = features[symbol]["atr14"]
@@ -666,10 +680,21 @@ def calculate_market_structure(symbol):
             - start_price
         )
 
-        move_strength = (
-            recent_move
-            / atr
+        normalized_range = (
+            atr
+            * math.sqrt(lookback)
         )
+
+        if normalized_range > 0:
+
+            move_strength = (
+                recent_move
+                / normalized_range
+            )
+
+        else:
+
+            move_strength = 0.0
 
     else:
 
@@ -1121,7 +1146,7 @@ async def start(
         "👹🧠 AI МАНГАС V5 FIX\n\n"
         "7 INDEX LIVE + FEATURE ENGINE ✅\n"
         "MARKET STRUCTURE ON ✅\n"
-        "STRUCTURE CLASSIFICATION FIX ON ✅\n\n"
+        "MOVE STRENGTH NORMALIZED FIX ON ✅\n\n"
         "History → Live Tick → Features → Structure\n\n"
         "/status"
     )
@@ -1308,7 +1333,7 @@ async def rawstatus(
         f"Active workers: "
         f"{len(active)}/7\n\n"
         "FEATURE + MARKET STRUCTURE MODE\n"
-        "STRUCTURE CLASSIFICATION FIX ON"
+        "MOVE STRENGTH NORMALIZED FIX ON"
     )
 
 
