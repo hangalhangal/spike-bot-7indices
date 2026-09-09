@@ -16,37 +16,17 @@ from telegram.ext import (
     ContextTypes,
 )
 
-
-# ============================================================
-# LOGGING
-# ============================================================
-
 logging.basicConfig(level=logging.INFO)
-
-
-# ============================================================
-# TELEGRAM TOKEN
-# ============================================================
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN missing")
 
-
-# ============================================================
-# DERIV NEW PUBLIC API
-# ============================================================
-
 DERIV_PUBLIC_WS = (
     "wss://api.derivws.com/"
     "trading/v1/options/ws/public"
 )
-
-
-# ============================================================
-# EXACTLY 7 INDEXES
-# ============================================================
 
 INDICES = {
     "BOOM1000": "Boom 1000 Index",
@@ -58,11 +38,6 @@ INDICES = {
     "CRASH900": "Crash 900 Index",
 }
 
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
 HISTORY_COUNT = 5000
 TRAINING_COUNT = 300
 TICK_BUFFER = 5000
@@ -72,24 +47,13 @@ SWING_RIGHT = 5
 
 MOVE_STRENGTH_LOOKBACK = 20
 
-
-# ============================================================
-# GLOBAL DATA
-# ============================================================
-
 active = set()
-
 tasks = {}
 
 ticks = {
     symbol: deque(maxlen=TICK_BUFFER)
     for symbol in INDICES
 }
-
-
-# ============================================================
-# DIAGNOSTIC STATE
-# ============================================================
 
 diag = {
     symbol: {
@@ -104,11 +68,6 @@ diag = {
     }
     for symbol in INDICES
 }
-
-
-# ============================================================
-# FEATURE STATE
-# ============================================================
 
 features = {
     symbol: {
@@ -125,11 +84,6 @@ features = {
     for symbol in INDICES
 }
 
-
-# ============================================================
-# MARKET STRUCTURE STATE
-# ============================================================
-
 structure = {
     symbol: {
         "swing_high": 0.0,
@@ -142,7 +96,6 @@ structure = {
         "support": 0.0,
         "resistance": 0.0,
         "move_strength": 0.0,
-
         "swing_high_count": 0,
         "swing_low_count": 0,
         "structure_error": "",
@@ -150,42 +103,27 @@ structure = {
     for symbol in INDICES
 }
 
-
-# ============================================================
-# ADVANCED ANALYSIS STATE
-# ============================================================
-
 advanced = {
     symbol: {
         "adx14": 0.0,
         "plus_di": 0.0,
         "minus_di": 0.0,
-
         "ob_bullish": 0,
         "ob_bearish": 0,
-
         "fvg_bullish": 0,
         "fvg_bearish": 0,
-
         "spike_score": 0.0,
         "spike_direction": "NONE",
-
         "compression": 0.0,
         "range_expansion": 0.0,
     }
     for symbol in INDICES
 }
 
-
-# ============================================================
-# SCORE STATE
-# ============================================================
-
 score = {
     symbol: {
         "buy": 0.0,
         "sell": 0.0,
-
         "trend": 0.0,
         "rsi": 0.0,
         "momentum": 0.0,
@@ -198,7 +136,6 @@ score = {
         "order_block": 0.0,
         "fvg": 0.0,
         "spike": 0.0,
-
         "decision": "WAIT",
         "strength": "LOW",
     }
@@ -206,21 +143,14 @@ score = {
 }
 
 
-# ============================================================
-# KEEP ALIVE SERVER
-# ============================================================
-
 def keep_alive():
-
     port = int(os.environ.get("PORT", "10000"))
 
     class Handler(BaseHTTPRequestHandler):
 
         def do_GET(self):
-
             self.send_response(200)
             self.end_headers()
-
             self.wfile.write(
                 b"AI MANGAS V5 FIX - SCORE ENGINE V1"
             )
@@ -239,10 +169,6 @@ threading.Thread(
     daemon=True
 ).start()
 
-
-# ============================================================
-# RESET SYMBOL
-# ============================================================
 
 def reset_diag(symbol):
 
@@ -321,10 +247,6 @@ def reset_diag(symbol):
     ticks[symbol].clear()
 
 
-# ============================================================
-# EMA
-# ============================================================
-
 def calculate_ema(prices, period):
 
     if len(prices) < period:
@@ -337,7 +259,6 @@ def calculate_ema(prices, period):
     multiplier = 2.0 / (period + 1.0)
 
     for price in values[1:]:
-
         ema = (
             (price - ema)
             * multiplier
@@ -346,10 +267,6 @@ def calculate_ema(prices, period):
 
     return ema
 
-
-# ============================================================
-# RSI - WILDER STYLE
-# ============================================================
 
 def calculate_rsi(prices, period=14):
 
@@ -430,10 +347,6 @@ def calculate_rsi(prices, period=14):
     )
 
 
-# ============================================================
-# ATR
-# ============================================================
-
 def calculate_atr(prices, period=14):
 
     if len(prices) < period + 1:
@@ -468,10 +381,6 @@ def calculate_atr(prices, period=14):
     )
 
 
-# ============================================================
-# MOMENTUM
-# ============================================================
-
 def calculate_momentum(prices, period=10):
 
     if len(prices) <= period:
@@ -491,10 +400,6 @@ def calculate_momentum(prices, period=10):
         / old_price
     ) * 100.0
 
-
-# ============================================================
-# VOLATILITY
-# ============================================================
 
 def calculate_volatility(prices, period=20):
 
@@ -539,15 +444,36 @@ def calculate_volatility(prices, period=20):
 
 
 # ============================================================
-# ADX / DMI
+# ADX / DMI — FIX V2
+# ============================================================
+#
+# IMPORTANT:
+# Энэ нь candle OHLC биш tick data дээр ажиллаж байгаа
+# тул стандарт Forex ADX-ийн яг хуулбар биш.
+#
+# Өмнөх хувилбар:
+#   - сүүлийн 29 tick дээр шууд +DM/-DM
+#   - нэг чиглэлийн tick давамгайлахад
+#     +DI 100 / -DI 0 эсвэл эсрэгээрээ
+#   - ADX 100 болж хэт туйлширч байсан.
+#
+# Шинэ хувилбар:
+#   - илүү урт tick window ашиглана
+#   - directional movement-ийг зөөлрүүлнэ
+#   - rolling DX-ийг ашиглана
+#   - ADX болон DI-г хэт туйлширсан 0/100 утгаас хамгаална
+#
+# БУСАД ЛОГИКТ ХҮРЭХГҮЙ.
 # ============================================================
 
 def calculate_adx_dmi(prices, period=14):
 
-    if len(prices) < period * 2 + 1:
+    minimum_needed = period * 4 + 1
+
+    if len(prices) < minimum_needed:
         return None
 
-    recent = prices[-(period * 2 + 1):]
+    recent = prices[-(period * 4 + 1):]
 
     tr_values = []
     plus_dm_values = []
@@ -558,21 +484,20 @@ def calculate_adx_dmi(prices, period=14):
         current = recent[i]
         previous = recent[i - 1]
 
-        movement = current - previous
+        movement = (
+            current - previous
+        )
 
         tr = abs(movement)
 
+        plus_dm = 0.0
+        minus_dm = 0.0
+
         if movement > 0:
             plus_dm = movement
-            minus_dm = 0.0
 
         elif movement < 0:
-            plus_dm = 0.0
             minus_dm = abs(movement)
-
-        else:
-            plus_dm = 0.0
-            minus_dm = 0.0
 
         tr_values.append(tr)
         plus_dm_values.append(plus_dm)
@@ -581,17 +506,24 @@ def calculate_adx_dmi(prices, period=14):
     if len(tr_values) < period:
         return None
 
-    atr = sum(
-        tr_values[:period]
-    ) / period
+    # --------------------------------------------------------
+    # Wilder-style smoothing
+    # --------------------------------------------------------
 
-    plus_dm = sum(
-        plus_dm_values[:period]
-    ) / period
+    atr = (
+        sum(tr_values[:period])
+        / period
+    )
 
-    minus_dm = sum(
-        minus_dm_values[:period]
-    ) / period
+    plus_dm_avg = (
+        sum(plus_dm_values[:period])
+        / period
+    )
+
+    minus_dm_avg = (
+        sum(minus_dm_values[:period])
+        / period
+    )
 
     dx_values = []
 
@@ -605,43 +537,57 @@ def calculate_adx_dmi(prices, period=14):
 
         atr = (
             (
-                atr * (period - 1)
+                atr
+                * (period - 1)
             )
             + tr_values[i]
         ) / period
 
-        plus_dm = (
+        plus_dm_avg = (
             (
-                plus_dm * (period - 1)
+                plus_dm_avg
+                * (period - 1)
             )
             + plus_dm_values[i]
         ) / period
 
-        minus_dm = (
+        minus_dm_avg = (
             (
-                minus_dm * (period - 1)
+                minus_dm_avg
+                * (period - 1)
             )
             + minus_dm_values[i]
         ) / period
 
-        if atr > 0:
+        if atr <= 0:
+            plus_di = 0.0
+            minus_di = 0.0
+
+        else:
 
             plus_di = (
                 100.0
-                * plus_dm
+                * plus_dm_avg
                 / atr
             )
 
             minus_di = (
                 100.0
-                * minus_dm
+                * minus_dm_avg
                 / atr
             )
 
-        else:
+            # Tick data дээр DI хэт 0/100
+            # болохоос хамгаална.
+            plus_di = max(
+                5.0,
+                min(95.0, plus_di)
+            )
 
-            plus_di = 0.0
-            minus_di = 0.0
+            minus_di = max(
+                5.0,
+                min(95.0, minus_di)
+            )
 
         denominator = (
             plus_di
@@ -661,15 +607,30 @@ def calculate_adx_dmi(prices, period=14):
 
             dx_values.append(dx)
 
-    if not dx_values:
+    if len(dx_values) < 3:
         return None
 
+    # --------------------------------------------------------
+    # ADX smoothing
+    # --------------------------------------------------------
+
+    adx_window = min(
+        period,
+        len(dx_values)
+    )
+
     adx = (
-        sum(dx_values[-period:])
-        / min(
-            period,
-            len(dx_values)
+        sum(
+            dx_values[-adx_window:]
         )
+        / adx_window
+    )
+
+    # Tick-based ADX-ийн хэт туйлшралыг
+    # хамгаалах дээд хязгаар.
+    adx = max(
+        0.0,
+        min(80.0, adx)
     )
 
     return {
@@ -678,10 +639,6 @@ def calculate_adx_dmi(prices, period=14):
         "minus_di": minus_di,
     }
 
-
-# ============================================================
-# MARKET STRUCTURE
-# ============================================================
 
 def calculate_market_structure(symbol):
 
@@ -730,7 +687,6 @@ def calculate_market_structure(symbol):
             current > max(left)
             and current >= max(right)
         ):
-
             swing_highs.append(
                 (i, current)
             )
@@ -739,7 +695,6 @@ def calculate_market_structure(symbol):
             current < min(left)
             and current <= min(right)
         ):
-
             swing_lows.append(
                 (i, current)
             )
@@ -823,32 +778,27 @@ def calculate_market_structure(symbol):
         high_is_higher
         and low_is_higher
     ):
-
         structure_name = "HH + HL"
 
     elif (
         high_is_lower
         and low_is_lower
     ):
-
         structure_name = "LH + LL"
 
     elif (
         high_is_higher
         and low_is_lower
     ):
-
         structure_name = "HH + LL"
 
     elif (
         high_is_lower
         and low_is_higher
     ):
-
         structure_name = "LH + HL"
 
     else:
-
         structure_name = "RANGE"
 
     bos = "NONE"
@@ -860,11 +810,9 @@ def calculate_market_structure(symbol):
     ):
 
         if current_price < latest_low:
-
             choch = "BEARISH"
 
         elif current_price > latest_high:
-
             bos = "BULLISH"
 
     elif (
@@ -873,11 +821,9 @@ def calculate_market_structure(symbol):
     ):
 
         if current_price > latest_high:
-
             choch = "BULLISH"
 
         elif current_price < latest_low:
-
             bos = "BEARISH"
 
     atr = features[symbol]["atr14"]
@@ -913,20 +859,15 @@ def calculate_market_structure(symbol):
             )
 
         else:
-
             move_strength = 0.0
 
     else:
-
         move_strength = 0.0
 
     structure[symbol] = {
 
-        "swing_high":
-            latest_high,
-
-        "swing_low":
-            latest_low,
+        "swing_high": latest_high,
+        "swing_low": latest_low,
 
         "previous_swing_high":
             previous_high,
@@ -965,13 +906,6 @@ def calculate_market_structure(symbol):
     return True
 
 
-# ============================================================
-# ORDER BLOCK PROXY
-#
-# Tick data does not contain OHLC candle bodies.
-# Therefore this is a conservative price-action proxy.
-# ============================================================
-
 def calculate_order_block(symbol):
 
     prices = [
@@ -998,7 +932,10 @@ def calculate_order_block(symbol):
     bullish = 0
     bearish = 0
 
-    for i in range(5, len(recent) - 3):
+    for i in range(
+        5,
+        len(recent) - 3
+    ):
 
         base = recent[i]
         future = recent[i + 3]
@@ -1006,11 +943,9 @@ def calculate_order_block(symbol):
         move = future - base
 
         if move >= atr * 2.0:
-
             bullish = 1
 
         if move <= -atr * 2.0:
-
             bearish = 1
 
     return {
@@ -1018,13 +953,6 @@ def calculate_order_block(symbol):
         "bearish": bearish,
     }
 
-
-# ============================================================
-# FVG / IMBALANCE PROXY
-#
-# With tick data, there are no candle highs/lows.
-# We use a 3-point displacement model.
-# ============================================================
 
 def calculate_fvg(symbol):
 
@@ -1034,7 +962,6 @@ def calculate_fvg(symbol):
     ]
 
     if len(prices) < 10:
-
         return {
             "bullish": 0,
             "bearish": 0,
@@ -1043,7 +970,6 @@ def calculate_fvg(symbol):
     atr = features[symbol]["atr14"]
 
     if not atr or atr <= 0:
-
         return {
             "bullish": 0,
             "bearish": 0,
@@ -1076,7 +1002,6 @@ def calculate_fvg(symbol):
                 p3 - p1
             ) >= atr * 2.0
         ):
-
             bullish = 1
 
         if (
@@ -1086,7 +1011,6 @@ def calculate_fvg(symbol):
                 p1 - p3
             ) >= atr * 2.0
         ):
-
             bearish = 1
 
     return {
@@ -1094,12 +1018,6 @@ def calculate_fvg(symbol):
         "bearish": bearish,
     }
 
-
-# ============================================================
-# SPIKE / PRE-SPIKE ANALYSIS
-#
-# This is a setup detector, NOT a guarantee.
-# ============================================================
 
 def calculate_spike_analysis(symbol):
 
@@ -1109,7 +1027,6 @@ def calculate_spike_analysis(symbol):
     ]
 
     if len(prices) < 50:
-
         return {
             "score": 0.0,
             "direction": "NONE",
@@ -1120,7 +1037,6 @@ def calculate_spike_analysis(symbol):
     atr = features[symbol]["atr14"]
 
     if not atr or atr <= 0:
-
         return {
             "score": 0.0,
             "direction": "NONE",
@@ -1174,7 +1090,6 @@ def calculate_spike_analysis(symbol):
         )
 
     else:
-
         compression_ratio = 1.0
 
     recent_move = abs(
@@ -1201,65 +1116,37 @@ def calculate_spike_analysis(symbol):
     score_value = 0.0
     direction = "NONE"
 
-    # --------------------------------------------------------
-    # Compression
-    # --------------------------------------------------------
-
     if compression_ratio < 0.75:
-
         score_value += 20.0
 
     elif compression_ratio < 0.90:
-
         score_value += 10.0
 
-
-    # --------------------------------------------------------
-    # Expansion / displacement
-    # --------------------------------------------------------
-
     if expansion_ratio >= 3.0:
-
         score_value += 25.0
 
     elif expansion_ratio >= 2.0:
-
         score_value += 15.0
-
-
-    # --------------------------------------------------------
-    # Directional bias
-    # --------------------------------------------------------
 
     momentum = features[symbol]["momentum10"]
 
     if symbol_is_boom:
 
-        # Boom spike is upward.
-        # A compressed/downward phase can precede
-        # a possible upward spike setup.
-
         if momentum < 0:
-
             score_value += 20.0
             direction = "UP_SPIKE"
 
         elif momentum > 0:
-
             score_value += 5.0
             direction = "UP_SPIKE"
 
     elif symbol_is_crash:
 
-        # Crash spike is downward.
-
         if momentum > 0:
-
             score_value += 20.0
             direction = "DOWN_SPIKE"
 
         elif momentum < 0:
-
             score_value += 5.0
             direction = "DOWN_SPIKE"
 
@@ -1275,10 +1162,6 @@ def calculate_spike_analysis(symbol):
         "expansion": expansion_ratio,
     }
 
-
-# ============================================================
-# ADVANCED ANALYSIS ENGINE
-# ============================================================
 
 def calculate_advanced_analysis(symbol):
 
@@ -1351,18 +1234,9 @@ def calculate_advanced_analysis(symbol):
     )
 
 
-# ============================================================
-# SIGNAL SCORE ENGINE V1
-#
-# IMPORTANT:
-# This creates a technical score only.
-# It DOES NOT send Telegram signals.
-# ============================================================
-
 def calculate_signal_score(symbol):
 
     if not diag[symbol]["features"]:
-
         return False
 
     f = features[symbol]
@@ -1374,10 +1248,6 @@ def calculate_signal_score(symbol):
 
     component_buy = {}
     component_sell = {}
-
-    # ========================================================
-    # 1. TREND — 15 POINTS
-    # ========================================================
 
     if f["trend"] == "BULLISH":
 
@@ -1393,13 +1263,6 @@ def calculate_signal_score(symbol):
 
         component_buy["trend"] = 0.0
         component_sell["trend"] = 0.0
-
-
-    # ========================================================
-    # 2. RSI — 10 POINTS
-    #
-    # Extreme RSI is treated as context, not blind reversal.
-    # ========================================================
 
     rsi = f["rsi14"]
 
@@ -1423,11 +1286,6 @@ def calculate_signal_score(symbol):
         sell += 6.0
         component_sell["rsi"] = 6.0
 
-
-    # ========================================================
-    # 3. MOMENTUM — 10 POINTS
-    # ========================================================
-
     momentum = f["momentum10"]
 
     if momentum > 0:
@@ -1439,11 +1297,6 @@ def calculate_signal_score(symbol):
 
         sell += 10.0
         component_sell["momentum"] = 10.0
-
-
-    # ========================================================
-    # 4. MARKET STRUCTURE — 15 POINTS
-    # ========================================================
 
     structure_name = s["structure"]
 
@@ -1467,11 +1320,6 @@ def calculate_signal_score(symbol):
         buy += 7.5
         sell += 7.5
 
-
-    # ========================================================
-    # 5. BOS / CHoCH — 10 POINTS
-    # ========================================================
-
     if s["bos"] == "BULLISH":
 
         buy += 10.0
@@ -1491,11 +1339,6 @@ def calculate_signal_score(symbol):
 
         sell += 10.0
         component_sell["bos_choch"] = 10.0
-
-
-    # ========================================================
-    # 6. SUPPORT / RESISTANCE — 10 POINTS
-    # ========================================================
 
     price = f["price"]
     atr = f["atr14"]
@@ -1528,11 +1371,6 @@ def calculate_signal_score(symbol):
             sell += 10.0
             component_sell["sr"] = 10.0
 
-
-    # ========================================================
-    # 7. MOVE STRENGTH — 5 POINTS
-    # ========================================================
-
     move_strength = s["move_strength"]
 
     if move_strength >= 4.0:
@@ -1546,11 +1384,6 @@ def calculate_signal_score(symbol):
 
             sell += 5.0
             component_sell["move_strength"] = 5.0
-
-
-    # ========================================================
-    # 8. ADX / DMI — 10 POINTS
-    # ========================================================
 
     adx = a["adx14"]
     plus_di = a["plus_di"]
@@ -1580,11 +1413,6 @@ def calculate_signal_score(symbol):
             sell += 5.0
             component_sell["adx"] = 5.0
 
-
-    # ========================================================
-    # 9. ORDER BLOCK — 5 POINTS
-    # ========================================================
-
     if a["ob_bullish"]:
 
         buy += 5.0
@@ -1595,11 +1423,6 @@ def calculate_signal_score(symbol):
         sell += 5.0
         component_sell["order_block"] = 5.0
 
-
-    # ========================================================
-    # 10. FVG / IMBALANCE — 5 POINTS
-    # ========================================================
-
     if a["fvg_bullish"]:
 
         buy += 5.0
@@ -1609,11 +1432,6 @@ def calculate_signal_score(symbol):
 
         sell += 5.0
         component_sell["fvg"] = 5.0
-
-
-    # ========================================================
-    # 11. BOOM / CRASH SPIKE SETUP — 5 POINTS
-    # ========================================================
 
     spike_score = a["spike_score"]
 
@@ -1641,31 +1459,8 @@ def calculate_signal_score(symbol):
             sell += 2.5
             component_sell["spike"] = 2.5
 
-
-    # ========================================================
-    # NORMALIZE TO 100
-    #
-    # Maximum theoretical raw score can be above 100
-    # because components are independent.
-    # ========================================================
-
-    buy = min(
-        100.0,
-        buy
-    )
-
-    sell = min(
-        100.0,
-        sell
-    )
-
-
-    # ========================================================
-    # DECISION
-    #
-    # NO TELEGRAM SIGNAL.
-    # Just analysis classification.
-    # ========================================================
+    buy = min(100.0, buy)
+    sell = min(100.0, sell)
 
     difference = abs(
         buy - sell
@@ -1679,11 +1474,8 @@ def calculate_signal_score(symbol):
     if highest >= 80 and difference >= 20:
 
         if buy > sell:
-
             decision = "BUY WATCH"
-
         else:
-
             decision = "SELL WATCH"
 
         strength = "VERY HIGH"
@@ -1691,11 +1483,8 @@ def calculate_signal_score(symbol):
     elif highest >= 70 and difference >= 15:
 
         if buy > sell:
-
             decision = "BUY WATCH"
-
         else:
-
             decision = "SELL WATCH"
 
         strength = "HIGH"
@@ -1703,11 +1492,8 @@ def calculate_signal_score(symbol):
     elif highest >= 55 and difference >= 10:
 
         if buy > sell:
-
             decision = "BUY BIAS"
-
         else:
-
             decision = "SELL BIAS"
 
         strength = "MEDIUM"
@@ -1717,163 +1503,140 @@ def calculate_signal_score(symbol):
         decision = "WAIT"
         strength = "LOW"
 
-
     score[symbol] = {
 
-        "buy":
-            buy,
+        "buy": buy,
+        "sell": sell,
 
-        "sell":
-            sell,
-
-        "trend":
-            max(
-                component_buy.get(
-                    "trend",
-                    0.0
-                ),
-                component_sell.get(
-                    "trend",
-                    0.0
-                )
+        "trend": max(
+            component_buy.get(
+                "trend",
+                0.0
             ),
+            component_sell.get(
+                "trend",
+                0.0
+            )
+        ),
 
-        "rsi":
-            max(
-                component_buy.get(
-                    "rsi",
-                    0.0
-                ),
-                component_sell.get(
-                    "rsi",
-                    0.0
-                )
+        "rsi": max(
+            component_buy.get(
+                "rsi",
+                0.0
             ),
+            component_sell.get(
+                "rsi",
+                0.0
+            )
+        ),
 
-        "momentum":
-            max(
-                component_buy.get(
-                    "momentum",
-                    0.0
-                ),
-                component_sell.get(
-                    "momentum",
-                    0.0
-                )
+        "momentum": max(
+            component_buy.get(
+                "momentum",
+                0.0
             ),
+            component_sell.get(
+                "momentum",
+                0.0
+            )
+        ),
 
-        "volatility":
-            0.0,
+        "volatility": 0.0,
 
-        "structure":
-            max(
-                component_buy.get(
-                    "structure",
-                    0.0
-                ),
-                component_sell.get(
-                    "structure",
-                    0.0
-                )
+        "structure": max(
+            component_buy.get(
+                "structure",
+                0.0
             ),
+            component_sell.get(
+                "structure",
+                0.0
+            )
+        ),
 
-        "bos_choch":
-            max(
-                component_buy.get(
-                    "bos_choch",
-                    0.0
-                ),
-                component_sell.get(
-                    "bos_choch",
-                    0.0
-                )
+        "bos_choch": max(
+            component_buy.get(
+                "bos_choch",
+                0.0
             ),
+            component_sell.get(
+                "bos_choch",
+                0.0
+            )
+        ),
 
-        "sr":
-            max(
-                component_buy.get(
-                    "sr",
-                    0.0
-                ),
-                component_sell.get(
-                    "sr",
-                    0.0
-                )
+        "sr": max(
+            component_buy.get(
+                "sr",
+                0.0
             ),
+            component_sell.get(
+                "sr",
+                0.0
+            )
+        ),
 
-        "move_strength":
-            max(
-                component_buy.get(
-                    "move_strength",
-                    0.0
-                ),
-                component_sell.get(
-                    "move_strength",
-                    0.0
-                )
+        "move_strength": max(
+            component_buy.get(
+                "move_strength",
+                0.0
             ),
+            component_sell.get(
+                "move_strength",
+                0.0
+            )
+        ),
 
-        "adx":
-            max(
-                component_buy.get(
-                    "adx",
-                    0.0
-                ),
-                component_sell.get(
-                    "adx",
-                    0.0
-                )
+        "adx": max(
+            component_buy.get(
+                "adx",
+                0.0
             ),
+            component_sell.get(
+                "adx",
+                0.0
+            )
+        ),
 
-        "order_block":
-            max(
-                component_buy.get(
-                    "order_block",
-                    0.0
-                ),
-                component_sell.get(
-                    "order_block",
-                    0.0
-                )
+        "order_block": max(
+            component_buy.get(
+                "order_block",
+                0.0
             ),
+            component_sell.get(
+                "order_block",
+                0.0
+            )
+        ),
 
-        "fvg":
-            max(
-                component_buy.get(
-                    "fvg",
-                    0.0
-                ),
-                component_sell.get(
-                    "fvg",
-                    0.0
-                )
+        "fvg": max(
+            component_buy.get(
+                "fvg",
+                0.0
             ),
+            component_sell.get(
+                "fvg",
+                0.0
+            )
+        ),
 
-        "spike":
-            max(
-                component_buy.get(
-                    "spike",
-                    0.0
-                ),
-                component_sell.get(
-                    "spike",
-                    0.0
-                )
+        "spike": max(
+            component_buy.get(
+                "spike",
+                0.0
             ),
+            component_sell.get(
+                "spike",
+                0.0
+            )
+        ),
 
-        "decision":
-            decision,
-
-        "strength":
-            strength,
+        "decision": decision,
+        "strength": strength,
     }
 
     return True
 
-
-# ============================================================
-# FEATURE ENGINE
-# ============================================================
 
 def calculate_features(symbol):
 
@@ -1931,61 +1694,37 @@ def calculate_features(symbol):
         or momentum10 is None
         or volatility20 is None
     ):
-
         return False
 
     if ema20 > ema50:
-
         trend = "BULLISH"
 
     elif ema20 < ema50:
-
         trend = "BEARISH"
 
     else:
-
         trend = "NEUTRAL"
 
     if momentum10 > 0:
-
         direction = "UP"
 
     elif momentum10 < 0:
-
         direction = "DOWN"
 
     else:
-
         direction = "FLAT"
 
     features[symbol] = {
 
-        "price":
-            price,
-
-        "ema20":
-            ema20,
-
-        "ema50":
-            ema50,
-
-        "rsi14":
-            rsi14,
-
-        "atr14":
-            atr14,
-
-        "momentum10":
-            momentum10,
-
-        "volatility20":
-            volatility20,
-
-        "trend":
-            trend,
-
-        "direction":
-            direction,
+        "price": price,
+        "ema20": ema20,
+        "ema50": ema50,
+        "rsi14": rsi14,
+        "atr14": atr14,
+        "momentum10": momentum10,
+        "volatility20": volatility20,
+        "trend": trend,
+        "direction": direction,
     }
 
     diag[symbol]["features"] = 1
@@ -2004,10 +1743,6 @@ def calculate_features(symbol):
 
     return True
 
-
-# ============================================================
-# HISTORY PROCESSING
-# ============================================================
 
 def process_history(
     symbol,
@@ -2056,7 +1791,6 @@ def process_history(
             )
 
         except Exception:
-
             continue
 
     diag[symbol]["training"] = min(
@@ -2069,10 +1803,6 @@ def process_history(
     )
 
 
-# ============================================================
-# DERIV WORKER
-# ============================================================
-
 async def deriv_worker(symbol):
 
     while symbol in active:
@@ -2080,10 +1810,6 @@ async def deriv_worker(symbol):
         reset_diag(symbol)
 
         try:
-
-            # =================================================
-            # HISTORY CONNECTION
-            # =================================================
 
             diag[symbol]["stage"] = (
                 "CONNECTING HISTORY"
@@ -2103,21 +1829,11 @@ async def deriv_worker(symbol):
                 )
 
                 request = {
-
-                    "ticks_history":
-                        symbol,
-
-                    "count":
-                        HISTORY_COUNT,
-
-                    "end":
-                        "latest",
-
-                    "style":
-                        "ticks",
-
-                    "req_id":
-                        2000
+                    "ticks_history": symbol,
+                    "count": HISTORY_COUNT,
+                    "end": "latest",
+                    "style": "ticks",
+                    "req_id": 2000
                 }
 
                 await ws.send(
@@ -2169,11 +1885,6 @@ async def deriv_worker(symbol):
 
                         break
 
-
-            # =================================================
-            # LIVE CONNECTION
-            # =================================================
-
             diag[symbol]["stage"] = (
                 "CONNECTING LIVE"
             )
@@ -2186,19 +1897,12 @@ async def deriv_worker(symbol):
             ) as ws:
 
                 diag[symbol]["connected"] = 1
-
                 diag[symbol]["stage"] = "LIVE"
 
                 request = {
-
-                    "ticks":
-                        symbol,
-
-                    "subscribe":
-                        1,
-
-                    "req_id":
-                        3000
+                    "ticks": symbol,
+                    "subscribe": 1,
+                    "req_id": 3000
                 }
 
                 await ws.send(
@@ -2231,7 +1935,6 @@ async def deriv_worker(symbol):
                         tick,
                         dict
                     ):
-
                         continue
 
                     quote = tick.get(
@@ -2244,7 +1947,6 @@ async def deriv_worker(symbol):
                     )
 
                     if quote is None:
-
                         continue
 
                     price = float(
@@ -2267,7 +1969,6 @@ async def deriv_worker(symbol):
                     )
 
                     diag[symbol]["stage"] = "LIVE"
-
 
         except asyncio.CancelledError:
 
@@ -2299,10 +2000,6 @@ async def deriv_worker(symbol):
                 await asyncio.sleep(5)
 
 
-# ============================================================
-# START INDEX
-# ============================================================
-
 def start_index(symbol):
 
     active.add(symbol)
@@ -2318,10 +2015,6 @@ def start_index(symbol):
             )
         )
 
-
-# ============================================================
-# /START
-# ============================================================
 
 async def start(
     update: Update,
@@ -2366,10 +2059,6 @@ async def start(
     )
 
 
-# ============================================================
-# /STATUS
-# ============================================================
-
 async def status(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -2378,26 +2067,18 @@ async def status(
     lines = [
 
         "👹🧠 AI МАНГАС V5 FIX",
-
         "",
-
         "🧠 FEATURE + MARKET STRUCTURE + SCORE",
-
         "==============================",
-
         ""
     ]
 
     for symbol, name in INDICES.items():
 
         d = diag[symbol]
-
         f = features[symbol]
-
         s = structure[symbol]
-
         a = advanced[symbol]
-
         sc = score[symbol]
 
         ws_status = (
@@ -2537,10 +2218,6 @@ async def status(
                 ),
             ])
 
-        # ====================================================
-        # ADVANCED ANALYSIS
-        # ====================================================
-
         if d["features"]:
 
             lines.extend([
@@ -2582,10 +2259,6 @@ async def status(
                 f"Range Expansion: "
                 f"{a['range_expansion']:.2f} ATR",
             ])
-
-            # =================================================
-            # SCORE
-            # =================================================
 
             lines.extend([
 
@@ -2679,10 +2352,6 @@ async def status(
         )
 
 
-# ============================================================
-# /SYMBOLS
-# ============================================================
-
 async def symbols(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -2710,10 +2379,6 @@ async def symbols(
         text
     )
 
-
-# ============================================================
-# /RAWSTATUS
-# ============================================================
 
 async def rawstatus(
     update: Update,
@@ -2753,10 +2418,6 @@ async def rawstatus(
     )
 
 
-# ============================================================
-# STARTUP
-# ============================================================
-
 async def startup(app):
 
     for symbol in INDICES:
@@ -2764,21 +2425,12 @@ async def startup(app):
         start_index(symbol)
 
 
-# ============================================================
-# TELEGRAM APPLICATION
-# ============================================================
-
 app = (
     ApplicationBuilder()
     .token(TOKEN)
     .post_init(startup)
     .build()
 )
-
-
-# ============================================================
-# COMMANDS
-# ============================================================
 
 app.add_handler(
     CommandHandler(
@@ -2808,10 +2460,6 @@ app.add_handler(
     )
 )
 
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
 
