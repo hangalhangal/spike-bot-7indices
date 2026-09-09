@@ -142,6 +142,11 @@ structure = {
         "support": 0.0,
         "resistance": 0.0,
         "move_strength": 0.0,
+
+        # DIAGNOSTIC
+        "swing_high_count": 0,
+        "swing_low_count": 0,
+        "structure_error": "",
     }
     for symbol in INDICES
 }
@@ -221,6 +226,11 @@ def reset_diag(symbol):
         "support": 0.0,
         "resistance": 0.0,
         "move_strength": 0.0,
+
+        # DIAGNOSTIC
+        "swing_high_count": 0,
+        "swing_low_count": 0,
+        "structure_error": "",
     }
 
     ticks[symbol].clear()
@@ -475,6 +485,15 @@ def calculate_market_structure(symbol):
     )
 
     if len(prices) < minimum_needed:
+
+        structure[symbol][
+            "structure_error"
+        ] = (
+            f"WAITING: "
+            f"PRICE DATA {len(prices)}/"
+            f"{minimum_needed}"
+        )
+
         return False
 
 
@@ -531,10 +550,53 @@ def calculate_market_structure(symbol):
             )
 
 
+    # --------------------------------------------------------
+    # DIAGNOSTIC COUNTS
+    # --------------------------------------------------------
+
+    high_count = len(swing_highs)
+
+    low_count = len(swing_lows)
+
+    structure[symbol][
+        "swing_high_count"
+    ] = high_count
+
+    structure[symbol][
+        "swing_low_count"
+    ] = low_count
+
+
+    # --------------------------------------------------------
+    # NOT ENOUGH SWINGS
+    # --------------------------------------------------------
+
     if (
-        len(swing_highs) < 2
-        or len(swing_lows) < 2
+        high_count < 2
+        or low_count < 2
     ):
+
+        missing = []
+
+        if high_count < 2:
+
+            missing.append(
+                f"HIGH {high_count}/2"
+            )
+
+        if low_count < 2:
+
+            missing.append(
+                f"LOW {low_count}/2"
+            )
+
+        structure[symbol][
+            "structure_error"
+        ] = (
+            "WAITING: "
+            + ", ".join(missing)
+        )
+
         return False
 
 
@@ -787,6 +849,16 @@ def calculate_market_structure(symbol):
 
         "move_strength":
             move_strength,
+
+        # DIAGNOSTIC
+        "swing_high_count":
+            high_count,
+
+        "swing_low_count":
+            low_count,
+
+        "structure_error":
+            "",
     }
 
     return True
@@ -1461,6 +1533,12 @@ async def status(
 
                 f"Move Strength: "
                 f"{s['move_strength']:.2f} ATR",
+
+                f"Swing High Count: "
+                f"{s['swing_high_count']}",
+
+                f"Swing Low Count: "
+                f"{s['swing_low_count']}",
             ])
 
 
@@ -1474,7 +1552,20 @@ async def status(
 
                 "Structure: WAITING ⏳",
 
-                "Swing data: WAITING ⏳",
+                (
+                    f"Swing High Count: "
+                    f"{s['swing_high_count']}/2"
+                ),
+
+                (
+                    f"Swing Low Count: "
+                    f"{s['swing_low_count']}/2"
+                ),
+
+                (
+                    f"Reason: "
+                    f"{s['structure_error'] or 'UNKNOWN'}"
+                ),
             ])
 
 
