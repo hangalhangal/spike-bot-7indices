@@ -21,8 +21,6 @@ INDICES={
 
 # Deriv API symbol-ийг active_symbols-оос автоматаар олно.
 DERIV_SYMBOLS={k:None for k in INDICES}
-# Deriv WebSocket market-data identifiers for the 7 requested Boom/Crash indices.
-# These are used as a safe bootstrap when active_symbols is unavailable/empty.
 KNOWN_DERIV_SYMBOLS={
     "BOOM1000":"BOOM1000",
     "BOOM500":"BOOM500",
@@ -248,7 +246,6 @@ async def send_signal(app,k,direction,conf,probs):
             diag[k]["last_telegram_error"]=str(e)
             logging.error("Telegram send: %s",e)
 
-
 def _norm_symbol_text(value):
     return "".join(ch for ch in str(value).upper() if ch.isalnum())
 
@@ -284,25 +281,21 @@ async def get_active_symbols(ws):
             break
     except Exception as e:
         logging.warning("active_symbols unavailable: %s",e)
-
     if not available:
         for key,stable_symbol in KNOWN_DERIV_SYMBOLS.items():
             if key not in found:
                 found[key]=stable_symbol
                 logging.warning("%s active_symbols unavailable; bootstrap=%s",key,stable_symbol)
-
     missing=[k for k in INDICES if k not in found]
     if missing:
         preview=", ".join(f"{sym}={name}" for sym,name in available[:80])
         raise RuntimeError("Active symbol not resolved: "+", ".join(missing)+" | Available: "+preview)
-
     DERIV_SYMBOLS.update(found)
     logging.info("DERIV SYMBOL MAP: %s",found)
     return found
 
 async def deriv_ws(k,app):
     diag[k]["stage"]="CONNECTING"
-    # FIX 1: ws.derivws.com -> ws.binaryws.com (Boom/Crash дээр subscribe баталгаатай)
     uri=f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
     diag[k]["last_error"]=""
     try:
@@ -311,34 +304,29 @@ async def deriv_ws(k,app):
             diag[k]["stage"]="CONNECTED"
             diag[k]["last_msg_type"]="CONNECTED"
             logging.info("%s CONNECTED",k)
-
             diag[k]["stage"]="SYMBOL_RESOLVING"
-            # ULTIMATE FIX: active_symbols шалгахгүй - шууд KNOWN_DERIV_SYMBOLS ашиглана
             symbol = KNOWN_DERIV_SYMBOLS[k]
             DERIV_SYMBOLS[k] = symbol
             logging.info(f"{k} DIRECT SYMBOL: {symbol} - NOT RESOLVED FIXED")
             diag[k]["stage"]="SYMBOL_RESOLVED"
             diag[k]["last_msg_type"]="SYMBOL_RESOLVED"
-
             diag[k]["stage"]="HISTORY_REQUESTING"
             await ws.send(json.dumps({
                 "ticks_history":symbol,
+                "adjust_start_time":1,
                 "count":WARMUP_HISTORY,
                 "end":"latest",
                 "style":"ticks",
-                "subscribe":0,
                 "req_id":1000
             }))
             diag[k]["stage"]="HISTORY_REQUESTED"
             diag[k]["last_msg_type"]="HISTORY_REQUESTED"
-
             history_received=False
             history_symbol=symbol
             while k in active and not history_received:
                 raw=await asyncio.wait_for(ws.recv(), timeout=20)
                 msg=json.loads(raw)
                 msg_type=msg.get("msg_type","")
-
                 if msg_type=="error" or "error" in msg:
                     err=msg.get("error",{})
                     message=str(err.get("message",err))
@@ -347,7 +335,6 @@ async def deriv_ws(k,app):
                     diag[k]["last_msg_type"]="ERROR"
                     diag[k]["stage"]="ERROR"
                     raise RuntimeError(message)
-
                 if msg_type=="history" and msg.get("history") is not None:
                     h=msg["history"]
                     ps=h.get("prices",[]); ts=h.get("times",[])
@@ -366,28 +353,19 @@ async def deriv_ws(k,app):
                     diag[k]["stage"]="WARMUP"
                     await asyncio.to_thread(warmup,k)
                     history_received=True
-
             if not history_received:
                 raise RuntimeError("History response timeout")
-
-            # FIX 2: ticks + subscribe=1 -> ticks_history + subscribe=1 + style ticks
-            # Энэ нь Boom/Crash дээр Input validation failed: subscribe алдааг засна
             diag[k]["stage"]="SUBSCRIBING"
             await ws.send(json.dumps({
-                "ticks_history":symbol,
-                "end":"latest",
-                "count":1,
-                "style":"ticks",
+                "ticks":symbol,
                 "subscribe":1,
                 "req_id":2000
             }))
             diag[k]["last_msg_type"]="SUBSCRIBE_REQUESTED"
-
             while k in active:
                 raw=await ws.recv()
                 msg=json.loads(raw)
                 msg_type=msg.get("msg_type","")
-
                 if msg_type=="error" or "error" in msg:
                     err=msg.get("error",{})
                     message=str(err.get("message",err))
@@ -397,14 +375,11 @@ async def deriv_ws(k,app):
                     diag[k]["stage"]="ERROR"
                     logging.error("%s Deriv error: %s",k,message)
                     raise RuntimeError(message)
-
-                # FIX 3: history + tick хоёуланг хүлээж авна (ticks_history subscribe 1 нь history msg_type-р tick явуулдаг)
                 tick_data = None
                 if msg_type=="tick" and msg.get("tick"):
                     tick_data = msg["tick"]
                 elif msg_type=="history" and msg.get("tick"):
                     tick_data = msg["tick"]
-                
                 if tick_data:
                     try:
                         price=float(tick_data["quote"])
@@ -414,18 +389,15 @@ async def deriv_ws(k,app):
                         diag[k]["last_error"]=f"tick parse: {e}"
                         diag[k]["last_msg_type"]="TICK_PARSE_ERROR"
                         continue
-
                     diag[k]["subscribed"]=1
                     diag[k]["stage"]="LIVE"
                     diag[k]["ticks"]+=1
                     diag[k]["last_tick"]=timestamp
                     diag[k]["last_msg_type"]="LIVE_TICK"
                     ticks_data[k].append((timestamp,price))
-
                     ps=[x[1] for x in ticks_data[k]]
                     if len(ps)<210:
                         continue
-
                     await evaluate(k,timestamp)
                     try:
                         f=features(ps)
@@ -435,22 +407,18 @@ async def deriv_ws(k,app):
                         diag[k]["last_msg_type"]="FEATURE_ERROR"
                         continue
                     if f is None: continue
-
                     diag[k]["features"]+=1
                     c,conf,probs=predict(k,f)
                     last_probs[k]=probs; last_class[k]=c
                     diag[k]["last_confidence"]=conf
                     if c!=0: diag[k]["candidates"]+=1
-
                     if not allowed(k,c,conf):
                         continue
-
                     direction="BUY" if c==1 else "SELL"
                     pending[k].append({"time":timestamp,"price":price,"direction":direction,"features":f,"confidence":conf})
                     last_signal[k]=time.time()
                     diag[k]["signals"]+=1
                     await send_signal(app,k,direction,conf,probs)
-
     except asyncio.CancelledError:
         diag[k]["connected"]=0
         diag[k]["subscribed"]=0
@@ -482,7 +450,6 @@ def allowed(k,c,conf):
         diag[k]["blocked_cooldown"]+=1;diag[k]["last_block_reason"]="COOLDOWN";return False
     return True
 
-
 async def start_ws(k,app):
     while k in active:
         try:
@@ -498,7 +465,6 @@ async def start_ws(k,app):
             logging.error("%s websocket: %s",k,e)
             if k in active:
                 await asyncio.sleep(5)
-
 
 def keep_alive():
     port=int(os.environ.get("PORT","10000"))
@@ -572,8 +538,6 @@ async def status(update,context):
               "━━━━━━━━━━━━━━━━━━")
         await update.message.reply_text(text)
     await update.message.reply_text("🟢 /status COMPLETE")
-
-
 
 async def symbols(update,context):
     chat_ids.add(update.effective_chat.id)
