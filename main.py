@@ -302,6 +302,7 @@ async def get_active_symbols(ws):
 
 async def deriv_ws(k,app):
     diag[k]["stage"]="CONNECTING"
+    # FIX 1: ws.derivws.com -> ws.binaryws.com (Boom/Crash дээр subscribe баталгаатай)
     uri=f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
     diag[k]["last_error"]=""
     try:
@@ -312,6 +313,7 @@ async def deriv_ws(k,app):
             logging.info("%s CONNECTED",k)
 
             diag[k]["stage"]="SYMBOL_RESOLVING"
+            # ULTIMATE FIX: active_symbols шалгахгүй - шууд KNOWN_DERIV_SYMBOLS ашиглана
             symbol = KNOWN_DERIV_SYMBOLS[k]
             DERIV_SYMBOLS[k] = symbol
             logging.info(f"{k} DIRECT SYMBOL: {symbol} - NOT RESOLVED FIXED")
@@ -368,11 +370,15 @@ async def deriv_ws(k,app):
             if not history_received:
                 raise RuntimeError("History response timeout")
 
+            # FIX 2: ticks + subscribe=1 -> ticks_history + subscribe=1 + style ticks
+            # Энэ нь Boom/Crash дээр Input validation failed: subscribe алдааг засна
             diag[k]["stage"]="SUBSCRIBING"
             await ws.send(json.dumps({
                 "ticks_history":symbol,
-                "subscribe":1,
+                "end":"latest",
+                "count":1,
                 "style":"ticks",
+                "subscribe":1,
                 "req_id":2000
             }))
             diag[k]["last_msg_type"]="SUBSCRIBE_REQUESTED"
@@ -392,6 +398,7 @@ async def deriv_ws(k,app):
                     logging.error("%s Deriv error: %s",k,message)
                     raise RuntimeError(message)
 
+                # FIX 3: history + tick хоёуланг хүлээж авна (ticks_history subscribe 1 нь history msg_type-р tick явуулдаг)
                 tick_data = None
                 if msg_type=="tick" and msg.get("tick"):
                     tick_data = msg["tick"]
