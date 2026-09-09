@@ -268,21 +268,103 @@ def calculate_ema(prices, period):
     return ema
 
 
+# ============================================================
+# RSI V2 — SYNTHETIC CANDLE CLOSE
+# ============================================================
+#
+# ЗӨВХӨН RSI LOGIC ӨӨРЧЛӨГДСӨН.
+#
+# Deriv raw tick data
+#        ↓
+# 20 tick = 1 synthetic candle
+#        ↓
+# Candle close
+#        ↓
+# RSI 14
+#
+# Raw tick бүр дээр RSI тооцохгүй.
+# Ингэснээр tick noise RSI-г 0/100 руу
+# хэт хүчтэй шахах эрсдэлийг багасгана.
+# ============================================================
+
 def calculate_rsi(prices, period=14):
 
-    if len(prices) < period + 1:
+    TICKS_PER_CANDLE = 20
+
+    if not isinstance(prices, list):
+        return None
+
+    clean_prices = []
+
+    for price in prices:
+
+        try:
+
+            value = float(price)
+
+            if math.isfinite(value):
+                clean_prices.append(value)
+
+        except Exception:
+            continue
+
+    if len(clean_prices) < (
+        (period + 1)
+        * TICKS_PER_CANDLE
+    ):
+        return None
+
+    synthetic_closes = []
+
+    usable_count = (
+        len(clean_prices)
+        // TICKS_PER_CANDLE
+    ) * TICKS_PER_CANDLE
+
+    usable_prices = clean_prices[
+        :usable_count
+    ]
+
+    for start in range(
+        0,
+        len(usable_prices),
+        TICKS_PER_CANDLE
+    ):
+
+        chunk = usable_prices[
+            start:
+            start + TICKS_PER_CANDLE
+        ]
+
+        if len(chunk) != TICKS_PER_CANDLE:
+            continue
+
+        close_price = chunk[-1]
+
+        if math.isfinite(close_price):
+            synthetic_closes.append(
+                close_price
+            )
+
+    if len(synthetic_closes) < (
+        period + 1
+    ):
         return None
 
     changes = []
 
-    for i in range(1, len(prices)):
+    for i in range(
+        1,
+        len(synthetic_closes)
+    ):
 
         change = (
-            prices[i]
-            - prices[i - 1]
+            synthetic_closes[i]
+            - synthetic_closes[i - 1]
         )
 
-        changes.append(change)
+        if math.isfinite(change):
+            changes.append(change)
 
     if len(changes) < period:
         return None
@@ -297,13 +379,27 @@ def calculate_rsi(prices, period=14):
         for change in changes[:period]
     ]
 
-    average_gain = sum(gains) / period
-    average_loss = sum(losses) / period
+    average_gain = (
+        sum(gains)
+        / period
+    )
+
+    average_loss = (
+        sum(losses)
+        / period
+    )
 
     for change in changes[period:]:
 
-        gain = max(change, 0.0)
-        loss = max(-change, 0.0)
+        gain = max(
+            change,
+            0.0
+        )
+
+        loss = max(
+            -change,
+            0.0
+        )
 
         average_gain = (
             (
@@ -321,12 +417,17 @@ def calculate_rsi(prices, period=14):
             + loss
         ) / period
 
-    if average_loss == 0:
+    if (
+        average_gain == 0.0
+        and average_loss == 0.0
+    ):
+        return 50.0
 
-        if average_gain == 0:
-            return 50.0
-
+    if average_loss == 0.0:
         return 100.0
+
+    if average_gain == 0.0:
+        return 0.0
 
     relative_strength = (
         average_gain
@@ -337,9 +438,15 @@ def calculate_rsi(prices, period=14):
         100.0
         - (
             100.0
-            / (1.0 + relative_strength)
+            / (
+                1.0
+                + relative_strength
+            )
         )
     )
+
+    if not math.isfinite(rsi):
+        return 50.0
 
     return max(
         0.0,
@@ -445,20 +552,6 @@ def calculate_volatility(prices, period=20):
 
 # ============================================================
 # ADX / DMI — V5
-# ============================================================
-#
-# Deriv tick data -> synthetic OHLC
-#
-# V5:
-#   - Бүх боломжтой history ашиглана
-#   - 20 tick = 1 synthetic candle
-#   - Богино tick noise-ийг багасгана
-#   - Standard TR / +DM / -DM
-#   - Wilder smoothing
-#   - Standard DX / ADX
-#   - Artificial 5/95, 80 clamp байхгүй
-#
-# ЗӨВХӨН ADX/DMI LOGIC ӨӨРЧЛӨГДСӨН.
 # ============================================================
 
 def calculate_adx_dmi(prices, period=14):
