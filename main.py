@@ -250,30 +250,22 @@ async def send_signal(app,k,direction,conf,probs):
             diag[k]["last_telegram_error"]=str(e)
             logging.error("Telegram send: %s",e)
 
-KNOWN_DERIV_SYMBOLS={
-    "BOOM1000":"BOOM1000",
-    "BOOM500":"BOOM500",
-    "BOOM600":"BOOM600",
-    "BOOM900":"BOOM900",
-    "CRASH1000":"CRASH1000",
-    "CRASH500":"CRASH500",
-    "CRASH900":"CRASH900",
-}
 
 def _norm_symbol_text(value):
     return "".join(ch for ch in str(value).upper() if ch.isalnum())
 
 async def get_active_symbols(ws):
-    """Resolve the 7 requested symbols without blocking startup on active_symbols.
+    """Resolve the seven requested markets from Deriv active_symbols.
 
-    Deriv's current API documents active_symbols as a public market-data
-    endpoint. However, a transient empty response must not prevent the bot
-    from using the known underlying identifiers for these seven indices.
+    We do not silently invent a symbol when active_symbols succeeds but does
+    not contain the requested market. A hardcoded fallback is used only when
+    the active_symbols request itself is unavailable; the following
+    ticks_history request then validates the identifier before live subscribe.
     """
     found={}
     available=[]
     try:
-        await ws.send(json.dumps({"active_symbols":"full","req_id":9001}))
+        await ws.send(json.dumps({"active_symbols":"brief","req_id":9001}))
         while True:
             raw=await asyncio.wait_for(ws.recv(), timeout=12)
             msg=json.loads(raw)
@@ -282,8 +274,8 @@ async def get_active_symbols(ws):
                 raise RuntimeError(err.get("message","active_symbols error"))
             if msg.get("msg_type")!="active_symbols":
                 continue
-
-            for item in msg.get("active_symbols") or []:
+            items=msg.get("active_symbols") or []
+            for item in items:
                 symbol=item.get("underlying_symbol") or item.get("symbol")
                 name=item.get("underlying_symbol_name") or item.get("display_name") or ""
                 if not symbol:
@@ -294,25 +286,30 @@ async def get_active_symbols(ws):
                 name_norm=_norm_symbol_text(name)
                 for key,info in INDICES.items():
                     key_norm=_norm_symbol_text(key)
-                    name_norm_full=_norm_symbol_text(info["name"])
-                    name_norm_short=_norm_symbol_text(info["name"].replace("Index",""))
-                    if sym_norm==key_norm or name_norm in (name_norm_full,name_norm_short):
+                    full=_norm_symbol_text(info["name"])
+                    short=_norm_symbol_text(info["name"].replace("Index",""))
+                    if sym_norm==key_norm or name_norm in (full,short):
                         found[key]=symbol
             break
     except Exception as e:
         logging.warning("active_symbols unavailable: %s",e)
 
-    # Bootstrap from the stable Deriv underlying identifiers.  This is not a
-    # guessed MT5 symbol; it is the same identifier used by ticks/ticks_history.
-    for key,stable_symbol in KNOWN_DERIV_SYMBOLS.items():
-        if key not in found:
-            found[key]=stable_symbol
+    # Only bootstrap missing values when the active_symbols call itself failed
+    # or returned no usable entries. If a valid active_symbols list was
+    # received, its identifiers are authoritative.
+    if not available:
+        for key,stable_symbol in KNOWN_DERIV_SYMBOLS.items():
+            if key not in found:
+                found[key]=stable_symbol
+                logging.warning("%s active_symbols unavailable; bootstrap=%s",key,stable_symbol)
+
+    missing=[k for k in INDICES if k not in found]
+    if missing:
+        preview=", ".join(f"{sym}={name}" for sym,name in available[:80])
+        raise RuntimeError("Active symbol not resolved: "+", ".join(missing)+" | Available: "+preview)
 
     DERIV_SYMBOLS.update(found)
-    if available:
-        logging.info("DERIV active_symbols returned %d entries; resolved=%s",len(available),found)
-    else:
-        logging.warning("DERIV active_symbols returned no entries; using known market-data identifiers: %s",found)
+    logging.info("DERIV SYMBOL MAP: %s",found)
     return found
 
 async def deriv_ws(k,app):
@@ -326,25 +323,70 @@ async def deriv_ws(k,app):
             diag[k]["last_msg_type"]="CONNECTED"
             logging.info("%s CONNECTED",k)
 
-            # IMPORTANT: never hard-code BOOM1000/CRASH1000 etc.
-            # Resolve all 7 from Deriv's active_symbols response first.
             diag[k]["stage"]="SYMBOL_RESOLVING"
             symbols=await get_active_symbols(ws)
             symbol=symbols[k]
             diag[k]["stage"]="SYMBOL_RESOLVED"
             diag[k]["last_msg_type"]="SYMBOL_RESOLVED"
 
+            # IMPORTANT: request history first and wait for its response.
+            # The previous version sent ticks and ticks_history back-to-back;
+            # this could make the live subscription fail even though history
+            # accepted the symbol. The history response is our first API-side
+            # validation of the exact identifier.
             diag[k]["stage"]="HISTORY_REQUESTING"
             await ws.send(json.dumps({
                 "ticks_history":symbol,
                 "count":WARMUP_HISTORY,
                 "end":"latest",
                 "style":"ticks",
+                "subscribe":0,
                 "req_id":1000
             }))
             diag[k]["stage"]="HISTORY_REQUESTED"
             diag[k]["last_msg_type"]="HISTORY_REQUESTED"
 
+            history_received=False
+            history_symbol=symbol
+            while k in active and not history_received:
+                raw=await asyncio.wait_for(ws.recv(), timeout=20)
+                msg=json.loads(raw)
+                msg_type=msg.get("msg_type","")
+
+                if msg_type=="error" or "error" in msg:
+                    err=msg.get("error",{})
+                    message=str(err.get("message",err))
+                    diag[k]["errors"]+=1
+                    diag[k]["last_error"]=message
+                    diag[k]["last_msg_type"]="ERROR"
+                    diag[k]["stage"]="ERROR"
+                    raise RuntimeError(message)
+
+                if msg_type=="history" and msg.get("history") is not None:
+                    h=msg["history"]
+                    ps=h.get("prices",[]); ts=h.get("times",[])
+                    history_data[k]=[(float(ts[i]),float(x)) for i,x in enumerate(ps) if i<len(ts)]
+                    diag[k]["history"]=len(history_data[k])
+                    diag[k]["last_msg_type"]="HISTORY"
+                    ticks_data[k].clear()
+                    for item in history_data[k][-LIVE_HISTORY:]:
+                        ticks_data[k].append(item)
+                    echo=msg.get("echo_req") or {}
+                    if echo.get("ticks_history"):
+                        history_symbol=str(echo["ticks_history"])
+                    # Prefer the symbol that Deriv just accepted.
+                    if history_symbol:
+                        symbol=history_symbol
+                        DERIV_SYMBOLS[k]=symbol
+                    diag[k]["stage"]="WARMUP"
+                    await asyncio.to_thread(warmup,k)
+                    history_received=True
+
+            if not history_received:
+                raise RuntimeError("History response timeout")
+
+            # Only after successful history validation do we subscribe to live ticks.
+            diag[k]["stage"]="SUBSCRIBING"
             await ws.send(json.dumps({
                 "ticks":symbol,
                 "subscribe":1,
@@ -363,21 +405,11 @@ async def deriv_ws(k,app):
                     diag[k]["errors"]+=1
                     diag[k]["last_error"]=message
                     diag[k]["last_msg_type"]="ERROR"
+                    diag[k]["stage"]="ERROR"
                     logging.error("%s Deriv error: %s",k,message)
-                    continue
-
-                if msg_type=="history" and msg.get("history"):
-                    h=msg["history"]
-                    ps=h.get("prices",[]); ts=h.get("times",[])
-                    history_data[k]=[(float(ts[i]),float(x)) for i,x in enumerate(ps) if i<len(ts)]
-                    diag[k]["history"]=len(history_data[k])
-                    diag[k]["last_msg_type"]="HISTORY"
-                    ticks_data[k].clear()
-                    for item in history_data[k][-LIVE_HISTORY:]:
-                        ticks_data[k].append(item)
-                    diag[k]["stage"]="WARMUP"
-                    await asyncio.to_thread(warmup,k)
-                    continue
+                    # A failed subscription must not be hidden as a healthy
+                    # connection. Reconnect so the symbol handshake is retried.
+                    raise RuntimeError(message)
 
                 if msg_type=="tick" and msg.get("tick"):
                     t=msg["tick"]
