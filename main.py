@@ -261,9 +261,10 @@ async def get_active_symbols(ws):
     use the stable Deriv symbol identifier as a fallback and let the tick
     request itself report any real API-side invalid-symbol error.
     """
-    await ws.send(json.dumps({"active_symbols":"brief","product_type":"basic","req_id":9001}))
+    await ws.send(json.dumps({"active_symbols":"brief","req_id":9001}))
     while True:
         raw=await ws.recv()
+        logging.info("DERIV active_symbols raw response: %s", raw[:2000])
         msg=json.loads(raw)
         if msg.get("msg_type")=="error":
             err=msg.get("error",{})
