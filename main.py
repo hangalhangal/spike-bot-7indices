@@ -32,7 +32,7 @@ async def deriv_ws(k,app):
             async with websockets.connect(uri,ping_interval=20,ping_timeout=20) as ws:
                 diag[k]["stage"]="HISTORY"
                 diag[k]["connected"]=1
-                # FIX V58.2 - end тоогоор заавал өгөх ёстой!
+                # FIX V58.2 - END INT болгож заслаа - Hist 1000 болсон!
                 await ws.send(json.dumps({"ticks_history":k,"count":1000,"end":int(time.time()),"style":"ticks"}))
                 async for raw in ws:
                     msg=json.loads(raw)
@@ -48,15 +48,21 @@ async def deriv_ws(k,app):
             async with websockets.connect(uri,ping_interval=20,ping_timeout=20) as ws:
                 diag[k]["stage"]="LIVE"
                 diag[k]["connected"]=1
-                await ws.send(json.dumps({"ticks":k,"subscribe":1}))
+                # FIX V58.3 - ЗӨВХӨН ЭНЭ МӨРИЙГ ЗАСЛАА! Symbol invalid алдааг засах!
+                await ws.send(json.dumps({"ticks_history":k,"subscribe":1,"style":"ticks"}))
                 async for raw in ws:
                     msg=json.loads(raw)
                     if "error" in msg: raise RuntimeError(msg["error"]["message"])
-                    t=msg.get("tick")
-                    if t:
+                    t=msg.get("tick") or msg.get("history")
+                    if isinstance(t,dict) and "quote" in t:
                         diag[k]["subscribed"]=1
                         diag[k]["ticks"]+=1
                         ticks[k].append((float(t.get("epoch",time.time())),float(t["quote"])))
+                    elif isinstance(msg.get("tick"),dict):
+                        tt=msg["tick"]
+                        diag[k]["subscribed"]=1
+                        diag[k]["ticks"]+=1
+                        ticks[k].append((float(tt.get("epoch",time.time())),float(tt["quote"])))
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -69,7 +75,7 @@ async def deriv_ws(k,app):
 def keep_alive():
     port=int(os.environ.get("PORT","10000"))
     class H(BaseHTTPRequestHandler):
-        def do_GET(self): self.send_response(200);self.end_headers();self.wfile.write(b"V58.2 FIXED END INT")
+        def do_GET(self): self.send_response(200);self.end_headers();self.wfile.write(b"V58.3 LIVE FIXED SYMBOL")
         def log_message(self,*a): pass
     HTTPServer(("0.0.0.0",port),H).serve_forever()
 threading.Thread(target=keep_alive,daemon=True).start()
@@ -83,7 +89,7 @@ async def start(update,context):
         active.add(k)
         if k not in tasks or tasks[k].done():
             tasks[k]=asyncio.create_task(deriv_ws(k,context.application))
-    await update.message.reply_text("V58.2 FIXED END INT - 7 INDEX",reply_markup=buttons())
+    await update.message.reply_text("V58.3 LIVE SYMBOL FIXED - 7 INDEX",reply_markup=buttons())
 
 async def button(update,context):
     q=update.callback_query;await q.answer();k=q.data
@@ -99,7 +105,7 @@ async def button(update,context):
 
 async def status(update,context):
     chat_ids.add(update.effective_chat.id)
-    await update.message.reply_text(f"ACTIVE {len(active)}/7 V58.2 END INT")
+    await update.message.reply_text(f"ACTIVE {len(active)}/7 V58.3 SYMBOL FIXED")
     for k in INDICES:
         d=diag[k]
         await update.message.reply_text(f"{k} Stage {d['stage']} WS {'ON' if d['connected'] else 'OFF'} Sub {'YES' if d['subscribed'] else 'NO'} Live {d['ticks']} Hist {d['history']} Err {d['error']}")
