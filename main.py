@@ -6,15 +6,10 @@ from telegram import Update,InlineKeyboardButton,InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder,CommandHandler,CallbackQueryHandler,ContextTypes
 
 logging.basicConfig(level=logging.INFO,format="%(asctime)s | %(levelname)s | %(message)s")
-
 TOKEN=os.getenv("TELEGRAM_TOKEN")
-if not TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN environment variable is missing")
+if not TOKEN: raise RuntimeError("TELEGRAM_TOKEN environment variable is missing")
 
-# ============================================================
-# ONLY THESE 7 BOOM / CRASH INDICES
-# ============================================================
-
+# ЗӨВХӨН ЭДГЭЭР 7
 INDICES={
 "BOOM1000":{"name":"Boom 1000 Index","type":"BOOM"},
 "BOOM500":{"name":"Boom 500 Index","type":"BOOM"},
@@ -22,42 +17,24 @@ INDICES={
 "BOOM900":{"name":"Boom 900 Index","type":"BOOM"},
 "CRASH1000":{"name":"Crash 1000 Index","type":"CRASH"},
 "CRASH500":{"name":"Crash 500 Index","type":"CRASH"},
-"CRASH900":{"name":"Crash 900 Index","type":"CRASH"}
-}
+"CRASH900":{"name":"Crash 900 Index","type":"CRASH"}}
 
-# Deriv active_symbols-оос бодит API symbol авна.
 DERIV_SYMBOLS={k:None for k in INDICES}
-
-# ============================================================
-# SETTINGS
-# ============================================================
 
 LIVE_HISTORY=500
 WARMUP_HISTORY=5000
-
 EARLY_MIN_SECONDS=60
 EARLY_MAX_SECONDS=120
-
 SPIKE_THRESHOLD=.10
-
 SIGNAL_CONFIDENCE=.40
 COOLDOWN_SECONDS=120
-
 LEARNING_RATE=.025
 L2=.0003
-
 MIN_TRAINING_SAMPLES=300
-
 FEATURE_COUNT=33
 CLASS_COUNT=3
-
 RECENT_RESULTS=100
-
 MEMORY_FILE="ai_memory_v5_fixed.json"
-
-# ============================================================
-# GLOBAL STATE
-# ============================================================
 
 active=set()
 chat_ids=set()
@@ -81,7 +58,7 @@ tasks={}
 trained=set()
 
 last_probs={
-    k:[1/3]*3
+    k:[1/3,1/3,1/3]
     for k in INDICES
 }
 
@@ -95,8 +72,11 @@ diag={}
 for k in INDICES:
 
     models[k]={
-        "weights":[[0.0]*FEATURE_COUNT for _ in range(3)],
-        "bias":[0.0]*3,
+        "weights":[
+            [0.0]*FEATURE_COUNT
+            for _ in range(3)
+        ],
+        "bias":[0.0,0.0,0.0],
         "samples":0
     }
 
@@ -107,8 +87,12 @@ for k in INDICES:
         "no_spike":0
     }
 
-    recent[k]=deque(maxlen=RECENT_RESULTS)
+    recent[k]=deque(
+        maxlen=RECENT_RESULTS
+    )
+
     pending[k]=[]
+
     last_signal[k]=0.0
 
     diag[k]={
@@ -135,7 +119,7 @@ for k in INDICES:
 
 
 # ============================================================
-# MEMORY
+# MEMORY SAVE
 # ============================================================
 
 def save_memory():
@@ -173,9 +157,15 @@ def save_memory():
         )
 
 
+# ============================================================
+# MEMORY LOAD
+# ============================================================
+
 def load_memory():
 
-    if not os.path.exists(MEMORY_FILE):
+    if not os.path.exists(
+        MEMORY_FILE
+    ):
         return
 
     try:
@@ -185,35 +175,48 @@ def load_memory():
             encoding="utf-8"
         ) as f:
 
-            d=json.load(f)
+            data=json.load(f)
 
         for k in INDICES:
 
-            m=d.get(
-                "models",
-                {}
-            ).get(k)
+            model=(
+                data
+                .get("models",{})
+                .get(k)
+            )
 
             if (
-                m
-                and len(m.get("weights",[]))==3
+                model
+                and len(
+                    model.get(
+                        "weights",
+                        []
+                    )
+                )==3
                 and all(
-                    len(x)==FEATURE_COUNT
-                    for x in m["weights"]
+                    len(row)==FEATURE_COUNT
+                    for row in model["weights"]
                 )
             ):
 
-                models[k]=m
+                models[k]=model
 
-            if k in d.get("stats",{}):
+            if k in data.get(
+                "stats",
+                {}
+            ):
+
                 stats[k].update(
-                    d["stats"][k]
+                    data["stats"][k]
                 )
 
-            if k in d.get("recent",{}):
+            if k in data.get(
+                "recent",
+                {}
+            ):
 
                 recent[k]=deque(
-                    d["recent"][k],
+                    data["recent"][k],
                     maxlen=RECENT_RESULTS
                 )
 
@@ -230,7 +233,7 @@ def load_memory():
 
 
 # ============================================================
-# AI
+# SOFTMAX
 # ============================================================
 
 def softmax(scores):
@@ -253,13 +256,22 @@ def softmax(scores):
     z=sum(ex)
 
     if z:
+
         return [
             x/z
             for x in ex
         ]
 
-    return [1/3]*3
+    return [
+        1/3,
+        1/3,
+        1/3
+    ]
 
+
+# ============================================================
+# DOT
+# ============================================================
 
 def dot(a,b):
 
@@ -269,64 +281,85 @@ def dot(a,b):
     )
 
 
+# ============================================================
+# PREDICTION
+# ============================================================
+
 def predict(k,f):
 
-    m=models[k]
+    model=models[k]
 
-    p=softmax(
-        [
-            dot(
-                m["weights"][c],
-                f
-            )+m["bias"][c]
-            for c in range(3)
-        ]
+    scores=[
+        dot(
+            model["weights"][c],
+            f
+        )
+        +
+        model["bias"][c]
+        for c in range(3)
+    ]
+
+    probabilities=softmax(
+        scores
     )
 
-    c=max(
+    cls=max(
         range(3),
-        key=lambda i:p[i]
+        key=lambda i:probabilities[i]
     )
 
-    return c,p[c],p
+    return (
+        cls,
+        probabilities[cls],
+        probabilities
+    )
 
+
+# ============================================================
+# ONLINE TRAINING
+# ============================================================
 
 def train_model(k,f,y):
 
-    m=models[k]
+    model=models[k]
 
-    p=softmax(
+    probabilities=softmax(
         [
             dot(
-                m["weights"][c],
+                model["weights"][c],
                 f
-            )+m["bias"][c]
+            )
+            +
+            model["bias"][c]
             for c in range(3)
         ]
     )
 
     for c in range(3):
 
-        err=(
+        error=(
             (1.0 if c==y else 0.0)
-            -p[c]
+            -
+            probabilities[c]
         )
 
         for i,x in enumerate(f):
 
-            m["weights"][c][i]+=(
+            model["weights"][c][i]+=(
                 LEARNING_RATE*
                 (
-                    err*x
-                    -L2*m["weights"][c][i]
+                    error*x
+                    -
+                    L2*
+                    model["weights"][c][i]
                 )
             )
 
-        m["bias"][c]+=(
-            LEARNING_RATE*err
+        model["bias"][c]+=(
+            LEARNING_RATE*error
         )
 
-    m["samples"]+=1
+    model["samples"]+=1
     stats[k]["training"]+=1
 
 
@@ -344,67 +377,70 @@ def features(prices):
         for x in prices
     ]
 
-    cur=p[-1]
+    current=p[-1]
 
-    if not cur:
+    if not current:
         return None
 
     def ret(n):
 
-        o=p[-1-n]
+        old=p[-1-n]
 
-        return (
-            (cur-o)/o*100
-            if o
-            else 0
-        )
+        if old:
 
-    (
-        r1,
-        r3,
-        r5,
-        r10,
-        r20,
-        r50,
-        r100,
-        r200
-    )=[
-        ret(n)
-        for n in (
-            1,
-            3,
-            5,
-            10,
-            20,
-            50,
-            100,
-            200
-        )
-    ]
+            return (
+                (current-old)
+                /
+                old
+                *
+                100
+            )
 
-    mom=(
-        .30*r5+
-        .25*r10+
-        .20*r20+
-        .15*r50+
+        return 0
+
+    r1=ret(1)
+    r3=ret(3)
+    r5=ret(5)
+    r10=ret(10)
+    r20=ret(20)
+    r50=ret(50)
+    r100=ret(100)
+    r200=ret(200)
+
+    momentum=(
+        .30*r5
+        +
+        .25*r10
+        +
+        .20*r20
+        +
+        .15*r50
+        +
         .10*r100
     )
 
-    acc=r5-r20
+    acceleration=r5-r20
 
     q=p[-50:]
 
-    ch=[
+    changes=[
         abs(
-            (q[i]-q[i-1])/q[i-1]*100
+            (q[i]-q[i-1])
+            /
+            q[i-1]
+            *
+            100
         )
-        for i in range(1,len(q))
+        for i in range(
+            1,
+            len(q)
+        )
         if q[i-1]
     ]
 
-    vol=(
-        sum(ch)/len(ch)
-        if ch
+    volatility=(
+        sum(changes)/len(changes)
+        if changes
         else 0
     )
 
@@ -418,7 +454,9 @@ def features(prices):
         for i in range(1,30)
     )
 
-    pressure=(up-down)/30
+    pressure=(
+        up-down
+    )/30
 
     gains=[]
     losses=[]
@@ -438,34 +476,47 @@ def features(prices):
             max(-d,0)
         )
 
-    ag=(
+    average_gain=(
         sum(gains)/len(gains)
         if gains
         else 0
     )
 
-    al=(
+    average_loss=(
         sum(losses)/len(losses)
         if losses
         else 0
     )
 
-    rsi=(
-        100
-        if ag and not al
-        else
-        (
-            50
-            if not al
-            else
-            100-100/(1+ag/al)
-        )
-    )
+    if average_gain and not average_loss:
 
-    rsi_n=(rsi-50)/50
+        rsi=100
+
+    elif not average_loss:
+
+        rsi=50
+
+    else:
+
+        rsi=(
+            100
+            -
+            100/
+            (
+                1
+                +
+                average_gain/
+                average_loss
+            )
+        )
+
+    rsi_normalized=(
+        rsi-50
+    )/50
 
     mean=lambda n:(
-        sum(p[-n:])/
+        sum(p[-n:])
+        /
         min(n,len(p))
     )
 
@@ -473,15 +524,17 @@ def features(prices):
     e26=mean(26)
 
     macd=(
-        (e12-e26)/cur*100
-    )
+        e12-e26
+    )/current*100
 
-    macds=(
-        (e12-mean(9))/cur*100
-    )
+    macd_signal=(
+        e12-mean(9)
+    )/current*100
 
-    tr=[
-        abs(p[i]-p[i-1])
+    true_ranges=[
+        abs(
+            p[i]-p[i-1]
+        )
         for i in range(
             max(1,len(p)-30),
             len(p)
@@ -489,58 +542,81 @@ def features(prices):
     ]
 
     atr=(
-        sum(tr)/len(tr)
-        if tr
+        sum(true_ranges)/len(true_ranges)
+        if true_ranges
         else 0
     )
 
-    atrp=(
-        atr/cur*100
+    atr_percent=(
+        atr/current*100
     )
 
-    atrm=(
+    atr_momentum=(
         (p[-1]-p[-2])/atr
         if atr
         else 0
     )
 
-    w=p[-20:]
+    window20=p[-20:]
 
-    mm=sum(w)/len(w)
+    average20=(
+        sum(window20)
+        /
+        len(window20)
+    )
 
     sd=(
         sum(
-            (x-mm)**2
-            for x in w
-        )/len(w)
+            (x-average20)**2
+            for x in window20
+        )
+        /
+        len(window20)
     )**.5
 
-    bb=(
-        (cur-mm)/(2*sd)
+    bollinger=(
+        (current-average20)
+        /
+        (2*sd)
         if sd
         else 0
     )
 
-    s20=mean(20)
-    s50=mean(50)
-    s100=mean(100)
+    sma20=mean(20)
+    sma50=mean(50)
+    sma100=mean(100)
 
     trend=(
-        .5*(
-            (s20-s50)/s50*100
-            if s50
+        .5*
+        (
+            (sma20-sma50)
+            /
+            sma50
+            *
+            100
+            if sma50
             else 0
         )
         +
-        .3*(
-            (s50-s100)/s100*100
-            if s100
+        .3*
+        (
+            (sma50-sma100)
+            /
+            sma100
+            *
+            100
+            if sma100
             else 0
         )
         +
-        .2*(
-            (cur-s20)/s20*100
-            if s20
+        .2*
+        (
+            (current-sma20)
+            /
+            sma20
+            *
+            100
+            if sma20
             else 0
         )
     )
@@ -562,7 +638,9 @@ def features(prices):
             minus-=d
 
     dmi=(
-        (plus-minus)/(plus+minus)
+        (plus-minus)
+        /
+        (plus+minus)
         if plus+minus
         else 0
     )
@@ -572,74 +650,77 @@ def features(prices):
     a=p[-20:]
     b=p[-40:-20]
 
-    rh=max(a)
-    rl=min(a)
+    recent_high=max(a)
+    recent_low=min(a)
 
-    ph=max(b)
-    pl=min(b)
+    previous_high=max(b)
+    previous_low=min(b)
 
     structure=(
         1
-        if rh>ph and rl>pl
-        else
-        (
+        if (
+            recent_high>previous_high
+            and
+            recent_low>previous_low
+        )
+        else (
             -1
-            if rh<ph and rl<pl
+            if (
+                recent_high<previous_high
+                and
+                recent_low<previous_low
+            )
             else 0
         )
     )
 
     bos=(
         1
-        if cur>ph
-        else
-        (
+        if current>previous_high
+        else (
             -1
-            if cur<pl
+            if current<previous_low
             else 0
         )
     )
 
-    ps=(
+    previous_structure=(
         1
         if p[-20]>p[-40]
-        else
-        (
+        else (
             -1
             if p[-20]<p[-40]
             else 0
         )
     )
 
-    cs=(
+    current_structure=(
         1
-        if cur>p[-20]
-        else
-        (
+        if current>p[-20]
+        else (
             -1
-            if cur<p[-20]
+            if current<p[-20]
             else 0
         )
     )
 
     choch=(
-        cs
-        if cs!=ps
+        current_structure
+        if current_structure!=previous_structure
         else 0
     )
 
-    look=p[-31:-1]
+    lookback=p[-31:-1]
 
-    hi=max(look)
-    lo=min(look)
+    highest=max(lookback)
+    lowest=min(lookback)
 
-    liq=(
+    liquidity=(
         1
-        if cur>hi
-        else
-        (
+        if current>highest
+        else (
             -1
-            if cur<lo
+            if current<lowest
             else 0
         )
     )
@@ -647,15 +728,14 @@ def features(prices):
     fvg=(
         1
         if p[-5]<p[-3]<p[-1]
-        else
-        (
+        else (
             -1
             if p[-5]>p[-3]>p[-1]
             else 0
         )
     )
 
-    dif=[
+    differences=[
         p[i]-p[i-1]
         for i in range(
             max(1,len(p)-15),
@@ -663,119 +743,136 @@ def features(prices):
         )
     ]
 
-    mx=max(
+    maximum=max(
         (
             abs(x)
-            for x in dif
+            for x in differences
         ),
         default=0
     )
 
-    ob=(
-        max(dif,key=abs)/mx
-        if mx
+    order_block=(
+        max(
+            differences,
+            key=abs
+        )/maximum
+        if maximum
         else 0
     )
 
-    old=[
-        abs(p[i]-p[i-1])
+    old_moves=[
+        abs(
+            p[i]-p[i-1]
+        )
         for i in range(
             max(1,len(p)-60),
             max(1,len(p)-30)
         )
     ]
 
-    new=[
-        abs(p[i]-p[i-1])
+    new_moves=[
+        abs(
+            p[i]-p[i-1]
+        )
         for i in range(
             max(1,len(p)-30),
             len(p)
         )
     ]
 
-    oa=(
-        sum(old)/len(old)
-        if old
+    old_average=(
+        sum(old_moves)/len(old_moves)
+        if old_moves
         else 0
     )
 
-    na=(
-        sum(new)/len(new)
-        if new
+    new_average=(
+        sum(new_moves)/len(new_moves)
+        if new_moves
         else 0
     )
 
     amd=0
 
-    if oa:
+    if old_average:
 
-        z=na/oa
+        ratio=(
+            new_average/
+            old_average
+        )
 
-        if z>1.3:
+        if ratio>1.3:
 
             amd=(
                 1
-                if mom>0
+                if momentum>0
                 else -1
             )
 
-        elif z<.75:
+        elif ratio<.75:
 
             amd=(
                 .5
-                if mom>0
+                if momentum>0
                 else -.5
             )
 
-    large=0
-    since=300
+    large_moves=0
+    since_spike=300
 
     for i in range(
         max(1,len(p)-300),
         len(p)
     ):
 
-        if (
-            abs(
-                (p[i]-p[i-1])/
-                p[i-1]*100
-            )
-            >=SPIKE_THRESHOLD
-        ):
+        move=(
+            (p[i]-p[i-1])
+            /
+            p[i-1]
+            *
+            100
+        )
 
-            large+=1
-            since=0
+        if abs(move)>=SPIKE_THRESHOLD:
+
+            large_moves+=1
+            since_spike=0
 
         else:
 
-            since=min(
-                since+1,
+            since_spike=min(
+                since_spike+1,
                 300
             )
 
-    dist=since/300
+    distance=(
+        since_spike/300
+    )
 
-    freq=min(
-        large/10,
+    frequency=min(
+        large_moves/10,
         1
     )
 
-    r10rng=(
-        max(p[-10:])-
+    range10=(
+        max(p[-10:])
+        -
         min(p[-10:])
     )
 
-    r50rng=(
-        max(p[-50:])-
+    range50=(
+        max(p[-50:])
+        -
         min(p[-50:])
     )
 
-    comp=(
-        1-min(
-            r10rng/r50rng,
+    compression=(
+        1-
+        min(
+            range10/range50,
             1
         )
-        if r50rng
+        if range50
         else 0
     )
 
@@ -788,34 +885,34 @@ def features(prices):
         r50,
         r100,
         r200,
-        mom,
-        acc,
-        vol,
+        momentum,
+        acceleration,
+        volatility,
         pressure,
-        rsi_n,
+        rsi_normalized,
         macd,
-        macds,
-        atrp,
-        atrm,
-        bb,
+        macd_signal,
+        atr_percent,
+        atr_momentum,
+        bollinger,
         trend,
         adx,
         dmi,
         structure,
         bos,
         choch,
-        liq,
+        liquidity,
         fvg,
-        ob,
+        order_block,
         amd,
-        dist,
-        freq,
-        comp,
+        distance,
+        frequency,
+        compression,
         r1-r3,
         pressure*.6+dmi*.4
     ]
 
-    return [
+    return[
         max(
             -5,
             min(
@@ -828,7 +925,7 @@ def features(prices):
 
 
 # ============================================================
-# LABELING / WARMUP
+# LABEL
 # ============================================================
 
 def label_at(
@@ -839,20 +936,25 @@ def label_at(
 
     if (
         i<210
-        or i>=len(prices)-1
-        or not prices[i]
+        or
+        i>=len(prices)-1
+        or
+        not prices[i]
     ):
         return None
 
-    t0=times[i]
-    start=prices[i]
+    start_time=times[i]
+    start_price=prices[i]
 
     for j in range(
         i+1,
         len(prices)
     ):
 
-        dt=times[j]-t0
+        dt=(
+            times[j]-
+            start_time
+        )
 
         if dt<EARLY_MIN_SECONDS:
             continue
@@ -861,44 +963,53 @@ def label_at(
             break
 
         move=(
-            prices[j]-start
-        )/start*100
+            (prices[j]-start_price)
+            /
+            start_price
+            *
+            100
+        )
 
         if abs(move)>=SPIKE_THRESHOLD:
 
-            return (
+            return(
                 1
                 if move>0
                 else 2
             )
 
-    if (
-        times[-1]-t0
+    if(
+        times[-1]-start_time
         >=EARLY_MAX_SECONDS
     ):
+
         return 0
 
     return None
 
+
+# ============================================================
+# WARM-UP
+# ============================================================
 
 def warmup(k):
 
     if k in trained:
         return
 
-    d=history_data[k]
+    data=history_data[k]
 
-    if len(d)<500:
+    if len(data)<500:
         return
 
-    ts=[
+    times=[
         x[0]
-        for x in d
+        for x in data
     ]
 
-    ps=[
+    prices=[
         x[1]
-        for x in d
+        for x in data
     ]
 
     pools=[
@@ -909,18 +1020,18 @@ def warmup(k):
 
     step=max(
         1,
-        (len(ps)-211)//1200
+        (len(prices)-211)//1200
     )
 
     for i in range(
         210,
-        len(ps)-1,
+        len(prices)-1,
         step
     ):
 
         y=label_at(
-            ps,
-            ts,
+            prices,
+            times,
             i
         )
 
@@ -930,7 +1041,7 @@ def warmup(k):
         try:
 
             f=features(
-                ps[:i+1]
+                prices[:i+1]
             )
 
         except Exception as e:
@@ -940,6 +1051,7 @@ def warmup(k):
             f=None
 
         if f is not None:
+
             pools[y].append(f)
 
     if not any(pools):
@@ -947,12 +1059,12 @@ def warmup(k):
 
     pairs=[]
 
-    n=max(
+    maximum=max(
         len(x)
         for x in pools
     )
 
-    for i in range(n):
+    for i in range(maximum):
 
         for y in range(3):
 
@@ -1007,31 +1119,34 @@ def warmup(k):
     logging.info(
         "%s warm-up labels NO=%d UP=%d DOWN=%d trained=%d",
         k,
-        *[
-            len(x)
-            for x in pools
-        ],
+        len(pools[0]),
+        len(pools[1]),
+        len(pools[2]),
         models[k]["samples"]
     )
 
 
 # ============================================================
-# LIVE RESULT EVALUATION
+# RESULT EVALUATION
 # ============================================================
 
 def eval_one(
-    pred,
+    prediction,
     data,
     now
 ):
 
-    t0=pred["time"]
-    start=pred["price"]
+    start_time=prediction["time"]
+    start_price=prediction["price"]
+
     found=None
 
-    for ts,price in data:
+    for timestamp,price in data:
 
-        dt=ts-t0
+        dt=(
+            timestamp-
+            start_time
+        )
 
         if dt<60:
             continue
@@ -1040,8 +1155,12 @@ def eval_one(
             break
 
         move=(
-            price-start
-        )/start*100
+            (price-start_price)
+            /
+            start_price
+            *
+            100
+        )
 
         if abs(move)>=SPIKE_THRESHOLD:
 
@@ -1055,24 +1174,28 @@ def eval_one(
 
     if found is None:
 
-        return (
+        return(
             None
-            if now-t0<120
+            if now-start_time<120
             else 0
         )
 
     wanted=(
         1
-        if pred["direction"]=="BUY"
+        if prediction["direction"]=="BUY"
         else 2
     )
 
-    return (
+    return(
         1
         if found==wanted
         else -1
     )
 
+
+# ============================================================
+# ONLINE EVALUATION
+# ============================================================
 
 async def evaluate(k,now):
 
@@ -1083,43 +1206,46 @@ async def evaluate(k,now):
         ticks_data[k]
     )
 
-    rem=[]
+    remaining=[]
     changed=False
 
-    for p in pending[k]:
+    for prediction in pending[k]:
 
-        r=eval_one(
-            p,
+        result=eval_one(
+            prediction,
             data,
             now
         )
 
-        if r is None:
+        if result is None:
 
-            rem.append(p)
+            remaining.append(
+                prediction
+            )
+
             continue
 
         changed=True
 
-        if r==1:
+        if result==1:
 
             stats[k]["ok"]+=1
             recent[k].append(1)
 
             actual=(
                 1
-                if p["direction"]=="BUY"
+                if prediction["direction"]=="BUY"
                 else 2
             )
 
-        elif r==-1:
+        elif result==-1:
 
             stats[k]["fail"]+=1
             recent[k].append(0)
 
             actual=(
                 2
-                if p["direction"]=="BUY"
+                if prediction["direction"]=="BUY"
                 else 1
             )
 
@@ -1133,11 +1259,11 @@ async def evaluate(k,now):
 
         train_model(
             k,
-            p["features"],
+            prediction["features"],
             actual
         )
 
-    pending[k]=rem
+    pending[k]=remaining
 
     if changed:
         save_memory()
@@ -1151,35 +1277,45 @@ async def send_signal(
     app,
     k,
     direction,
-    conf,
-    probs
+    confidence,
+    probabilities
 ):
 
     info=INDICES[k]
+
+    if direction=="BUY":
+
+        action="BUY NOW 🟢"
+        spike="UP SPIKE 📈"
+
+    else:
+
+        action="SELL NOW 🔴"
+        spike="DOWN SPIKE 📉"
 
     text=(
         "🧠🔥 AI MANIAC V5 FIX\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"📊 {info['name']}\n"
-        f"⚡ "
-        f"{'BUY NOW 🟢' if direction=='BUY' else 'SELL NOW 🔴'}\n"
-        f"🎯 "
-        f"{'UP SPIKE 📈' if direction=='BUY' else 'DOWN SPIKE 📉'}\n"
-        "⏱️ Expected: 60–120 sec after signal\n"
-        f"🧠 Confidence: {conf*100:.1f}%\n"
+        f"⚡ {action}\n"
+        f"🎯 {spike}\n"
+        "⏱️ Expected movement: 60–120 sec\n"
+        f"🧠 Confidence: {confidence*100:.1f}%\n"
         f"📚 Training: {models[k]['samples']}\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"UP: {probs[1]*100:.1f}%\n"
-        f"DOWN: {probs[2]*100:.1f}%\n"
-        f"NO SPIKE: {probs[0]*100:.1f}%\n"
+        f"📈 UP: {probabilities[1]*100:.1f}%\n"
+        f"📉 DOWN: {probabilities[2]*100:.1f}%\n"
+        f"⚪ NO SPIKE: {probabilities[0]*100:.1f}%\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ Prediction only — guaranteed profit биш."
     )
 
-    for cid in list(chat_ids):
+    for chat_id in list(chat_ids):
 
         try:
 
             await app.bot.send_message(
-                chat_id=cid,
+                chat_id=chat_id,
                 text=text
             )
 
@@ -1191,26 +1327,29 @@ async def send_signal(
             diag[k]["last_telegram_error"]=str(e)
 
             logging.error(
-                "Telegram send: %s",
+                "Telegram send error: %s",
                 e
             )
 
 
 # ============================================================
-# ROBUST DERIV SYMBOL RESOLUTION
+# SYMBOL NORMALIZATION
 # ============================================================
 
-def _norm_text(value):
+def normalize_symbol(value):
 
-    return " ".join(
-        str(value or "")
-        .upper()
-        .replace("_"," ")
-        .split()
+    return "".join(
+        ch
+        for ch in str(value).upper()
+        if ch.isalnum()
     )
 
 
-def _symbol_matches(
+# ============================================================
+# SYMBOL MATCH
+# ============================================================
+
+def symbol_matches(
     key,
     info,
     item
@@ -1218,31 +1357,52 @@ def _symbol_matches(
 
     symbol=(
         item.get("underlying_symbol")
-        or item.get("symbol")
-        or ""
+        or
+        item.get("symbol")
+        or
+        ""
     )
 
     name=(
         item.get("underlying_symbol_name")
-        or item.get("display_name")
-        or ""
+        or
+        item.get("display_name")
+        or
+        ""
     )
 
-    target=_norm_text(
+    target=normalize_symbol(
         info["name"]
     )
 
-    n=_norm_text(name)
+    n=normalize_symbol(
+        name
+    )
 
-    sym=_norm_text(
+    sym=normalize_symbol(
         symbol
-    ).replace(" ","")
+    )
 
-    # 1. Exact name
+    key_normalized=normalize_symbol(
+        key
+    )
+
+    name_without_index=normalize_symbol(
+        info["name"].replace(
+            "Index",
+            ""
+        )
+    )
+
     if n==target:
         return True
 
-    # 2. BOOM/CRASH + number + INDEX
+    if n==name_without_index:
+        return True
+
+    if sym==key_normalized:
+        return True
+
     family=info["type"]
 
     number=(
@@ -1251,40 +1411,28 @@ def _symbol_matches(
         .replace("CRASH","")
     )
 
-    if (
+    if(
         family in n
-        and number in n
-        and "INDEX" in n
+        and
+        number in n
     ):
         return True
 
-    # 3. Symbol match
-    if (
+    if(
         family in sym
-        and number in sym
+        and
+        number in sym
     ):
         return True
 
     return False
 
 
+# ============================================================
+# ACTIVE SYMBOLS
+# ============================================================
+
 async def get_active_symbols(ws):
-
-    """
-    Current Deriv API-compatible active_symbols request.
-
-    IMPORTANT:
-    product_type is intentionally NOT sent because
-    current New API removed it.
-
-    Supports:
-        underlying_symbol
-        underlying_symbol_name
-
-    and legacy:
-        symbol
-        display_name
-    """
 
     request={
         "active_symbols":"brief",
@@ -1299,40 +1447,44 @@ async def get_active_symbols(ws):
 
         raw=await ws.recv()
 
-        msg=json.loads(raw)
+        message=json.loads(raw)
 
-        msg_type=msg.get(
+        message_type=message.get(
             "msg_type",
             ""
         )
 
-        if (
-            msg_type=="error"
-            or "error" in msg
+        if(
+            message_type=="error"
+            or
+            "error" in message
         ):
 
-            err=msg.get(
+            error=message.get(
                 "error",
                 {}
             )
 
-            message=str(
-                err.get(
-                    "message",
-                    err
+            raise RuntimeError(
+                "active_symbols: "
+                +
+                str(
+                    error.get(
+                        "message",
+                        error
+                    )
                 )
             )
 
-            raise RuntimeError(
-                "active_symbols: "
-                +message
-            )
-
-        if msg_type!="active_symbols":
+        if(
+            message_type
+            !=
+            "active_symbols"
+        ):
             continue
 
         items=(
-            msg.get(
+            message.get(
                 "active_symbols"
             )
             or []
@@ -1340,125 +1492,90 @@ async def get_active_symbols(ws):
 
         found={}
 
-        # ----------------------------------------------------
-        # First try real symbols returned by Deriv
-        # ----------------------------------------------------
+        relevant=[]
 
         for item in items:
 
             symbol=(
-                item.get("underlying_symbol")
-                or item.get("symbol")
+                item.get(
+                    "underlying_symbol"
+                )
+                or
+                item.get(
+                    "symbol"
+                )
+            )
+
+            name=(
+                item.get(
+                    "underlying_symbol_name"
+                )
+                or
+                item.get(
+                    "display_name"
+                )
+                or
+                ""
             )
 
             if not symbol:
                 continue
 
+            symbol=str(symbol)
+            name=str(name)
+
+            if(
+                "BOOM"
+                in normalize_symbol(name)
+                or
+                "CRASH"
+                in normalize_symbol(name)
+            ):
+
+                relevant.append(
+                    f"{name}={symbol}"
+                )
+
             for key,info in INDICES.items():
 
-                if (
+                if(
                     key not in found
-                    and _symbol_matches(
+                    and
+                    symbol_matches(
                         key,
                         info,
                         item
                     )
                 ):
 
-                    found[key]=str(
-                        symbol
-                    )
-
-        # ----------------------------------------------------
-        # Stable known Deriv symbols.
-        #
-        # These are used only if active_symbols does not
-        # expose the corresponding Boom/Crash entry.
-        # ----------------------------------------------------
-
-        stable={
-            "BOOM1000":"BOOM1000",
-            "BOOM500":"BOOM500",
-            "BOOM600":"BOOM600",
-            "BOOM900":"BOOM900",
-            "CRASH1000":"CRASH1000",
-            "CRASH500":"CRASH500",
-            "CRASH900":"CRASH900"
-        }
-
-        for key,symbol in stable.items():
-
-            if key not in found:
-
-                found[key]=symbol
-
-                logging.warning(
-                    "%s not listed by active_symbols; "
-                    "using stable symbol %s",
-                    key,
-                    symbol
-                )
-
-        # ----------------------------------------------------
-        # Final validation
-        # ----------------------------------------------------
+                    found[key]=symbol
 
         missing=[
             k
             for k in INDICES
-            if not found.get(k)
+            if k not in found
         ]
 
         if missing:
 
-            relevant=[]
-
-            for item in items:
-
-                name=(
-                    item.get(
-                        "underlying_symbol_name"
-                    )
-                    or item.get(
-                        "display_name"
-                    )
-                    or ""
-                )
-
-                symbol=(
-                    item.get(
-                        "underlying_symbol"
-                    )
-                    or item.get(
-                        "symbol"
-                    )
-                    or ""
-                )
-
-                n=_norm_text(name)
-
-                if (
-                    "BOOM" in n
-                    or "CRASH" in n
-                ):
-
-                    relevant.append(
-                        f"{name}={symbol}"
-                    )
-
-            preview=(
-                "; ".join(
-                    relevant[:40]
-                )
-                or
-                "no Boom/Crash entries returned"
+            preview="; ".join(
+                relevant[:40]
             )
 
+            if not preview:
+                preview=(
+                    "no Boom/Crash "
+                    "entries returned"
+                )
+
             raise RuntimeError(
-                "Active symbols missing: "
-                +", ".join(missing)
-                +" | Deriv returned: "
-                +preview
+                "Live symbol not resolved: "
+                +
+                ", ".join(missing)
+                +
+                " | Deriv active_symbols: "
+                +
+                preview
             )
 
         DERIV_SYMBOLS.update(
@@ -1466,7 +1583,7 @@ async def get_active_symbols(ws):
         )
 
         logging.info(
-            "DERIV SYMBOL MAP: %s",
+            "REAL DERIV SYMBOL MAP: %s",
             found
         )
 
@@ -1480,7 +1597,7 @@ async def get_active_symbols(ws):
 async def deriv_ws(k,app):
 
     uri=(
-        "wss://ws.binaryws.com/"
+        "wss://ws.derivws.com/"
         "websockets/v3?app_id=1089"
     )
 
@@ -1499,12 +1616,12 @@ async def deriv_ws(k,app):
             diag[k]["last_msg_type"]="CONNECTED"
 
             logging.info(
-                "%s CONNECTED",
+                "%s WebSocket CONNECTED",
                 k
             )
 
             # ------------------------------------------------
-            # Resolve symbols
+            # REAL SYMBOL FROM DERIV
             # ------------------------------------------------
 
             symbols=await get_active_symbols(
@@ -1513,62 +1630,75 @@ async def deriv_ws(k,app):
 
             symbol=symbols[k]
 
+            DERIV_SYMBOLS[k]=symbol
+
             diag[k]["last_msg_type"]="SYMBOL_RESOLVED"
 
             logging.info(
-                "%s resolved -> %s",
+                "%s REAL SYMBOL = %s",
                 k,
                 symbol
             )
 
             # ------------------------------------------------
             # HISTORY
-            #
-            # IMPORTANT:
-            # No subscribe:0 here.
             # ------------------------------------------------
+
+            history_request={
+                "ticks_history":symbol,
+                "count":WARMUP_HISTORY,
+                "end":"latest",
+                "style":"ticks",
+                "req_id":1000
+            }
 
             await ws.send(
                 json.dumps(
-                    {
-                        "ticks_history":symbol,
-                        "count":WARMUP_HISTORY,
-                        "end":"latest",
-                        "style":"ticks",
-                        "req_id":1000
-                    }
+                    history_request
                 )
             )
 
-            diag[k]["last_msg_type"]="HISTORY_REQUESTED"
+            diag[k]["last_msg_type"]=(
+                "HISTORY_REQUESTED"
+            )
 
             # ------------------------------------------------
-            # LIVE TICKS
+            # LIVE SUBSCRIPTION
             # ------------------------------------------------
+
+            live_request={
+                "ticks":symbol,
+                "subscribe":1,
+                "req_id":2000
+            }
+
+            logging.info(
+                "%s LIVE SUBSCRIBE: %s",
+                k,
+                live_request
+            )
 
             await ws.send(
                 json.dumps(
-                    {
-                        "ticks":symbol,
-                        "subscribe":1,
-                        "req_id":2000
-                    }
+                    live_request
                 )
             )
 
-            diag[k]["last_msg_type"]="SUBSCRIBE_REQUESTED"
+            diag[k]["last_msg_type"]=(
+                "SUBSCRIBE_REQUESTED"
+            )
 
             # ------------------------------------------------
-            # RECEIVE LOOP
+            # MESSAGE LOOP
             # ------------------------------------------------
 
             while k in active:
 
                 raw=await ws.recv()
 
-                msg=json.loads(raw)
+                message=json.loads(raw)
 
-                msg_type=msg.get(
+                message_type=message.get(
                     "msg_type",
                     ""
                 )
@@ -1577,32 +1707,56 @@ async def deriv_ws(k,app):
                 # ERROR
                 # --------------------------------------------
 
-                if (
-                    msg_type=="error"
-                    or "error" in msg
+                if(
+                    message_type=="error"
+                    or
+                    "error" in message
                 ):
 
-                    err=msg.get(
+                    error=message.get(
                         "error",
                         {}
                     )
 
-                    message=str(
-                        err.get(
+                    error_message=str(
+                        error.get(
                             "message",
-                            err
+                            error
                         )
                     )
 
                     diag[k]["errors"]+=1
-                    diag[k]["last_error"]=message
-                    diag[k]["last_msg_type"]="ERROR"
+
+                    diag[k]["last_error"]=(
+                        error_message
+                    )
+
+                    diag[k]["last_msg_type"]=(
+                        "ERROR"
+                    )
 
                     logging.error(
-                        "%s Deriv error: %s",
+                        "%s DERIV ERROR: %s",
                         k,
-                        message
+                        error_message
                     )
+
+                    # A subscription error is fatal for this
+                    # connection. Reconnect instead of looping
+                    # forever on the same invalid request.
+                    if(
+                        "invalid"
+                        in error_message.lower()
+                        or
+                        "subscribe"
+                        in error_message.lower()
+                    ):
+
+                        raise RuntimeError(
+                            "Live tick subscription failed: "
+                            +
+                            error_message
+                        )
 
                     continue
 
@@ -1610,40 +1764,41 @@ async def deriv_ws(k,app):
                 # HISTORY
                 # --------------------------------------------
 
-                if (
-                    msg_type=="history"
-                    and msg.get("history")
+                if(
+                    message_type=="history"
+                    and
+                    message.get("history")
                 ):
 
-                    h=msg["history"]
+                    history=message["history"]
 
-                    ps=h.get(
+                    prices=history.get(
                         "prices",
                         []
                     )
 
-                    ts=h.get(
+                    times=history.get(
                         "times",
                         []
                     )
 
                     history_data[k]=[
                         (
-                            float(ts[i]),
-                            float(x)
+                            float(times[i]),
+                            float(price)
                         )
-                        for i,x in enumerate(ps)
-                        if i<len(ts)
+                        for i,price
+                        in enumerate(prices)
+                        if i<len(times)
                     ]
 
                     diag[k]["history"]=len(
                         history_data[k]
                     )
 
-                    diag[k]["last_msg_type"]="HISTORY"
-
-                    # Latest 500 historical ticks
-                    # become live feature buffer.
+                    diag[k]["last_msg_type"]=(
+                        "HISTORY"
+                    )
 
                     ticks_data[k].clear()
 
@@ -1655,17 +1810,9 @@ async def deriv_ws(k,app):
                             item
                         )
 
-                    # Train without blocking Telegram.
-
                     await asyncio.to_thread(
                         warmup,
                         k
-                    )
-
-                    logging.info(
-                        "%s HISTORY received: %d",
-                        k,
-                        diag[k]["history"]
                     )
 
                     continue
@@ -1674,21 +1821,22 @@ async def deriv_ws(k,app):
                 # LIVE TICK
                 # --------------------------------------------
 
-                if (
-                    msg_type=="tick"
-                    and msg.get("tick")
+                if(
+                    message_type=="tick"
+                    and
+                    message.get("tick")
                 ):
 
-                    t=msg["tick"]
+                    tick=message["tick"]
 
                     try:
 
                         price=float(
-                            t["quote"]
+                            tick["quote"]
                         )
 
                         timestamp=float(
-                            t.get(
+                            tick.get(
                                 "epoch",
                                 time.time()
                             )
@@ -1708,10 +1856,19 @@ async def deriv_ws(k,app):
 
                         continue
 
+                    # ----------------------------------------
+                    # LIVE TICK CONFIRMED
+                    # ----------------------------------------
+
                     diag[k]["subscribed"]=1
+
                     diag[k]["ticks"]+=1
+
                     diag[k]["last_tick"]=timestamp
-                    diag[k]["last_msg_type"]="LIVE_TICK"
+
+                    diag[k]["last_msg_type"]=(
+                        "LIVE_TICK"
+                    )
 
                     ticks_data[k].append(
                         (
@@ -1720,16 +1877,16 @@ async def deriv_ws(k,app):
                         )
                     )
 
-                    ps=[
+                    prices=[
                         x[1]
                         for x in ticks_data[k]
                     ]
 
-                    if len(ps)<210:
+                    if len(prices)<210:
                         continue
 
                     # ----------------------------------------
-                    # Evaluate old predictions
+                    # ONLINE LEARNING
                     # ----------------------------------------
 
                     await evaluate(
@@ -1738,18 +1895,24 @@ async def deriv_ws(k,app):
                     )
 
                     # ----------------------------------------
-                    # Calculate features
+                    # FEATURES
                     # ----------------------------------------
 
                     try:
 
-                        f=features(ps)
+                        f=features(
+                            prices
+                        )
 
                     except Exception as e:
 
                         diag[k]["errors"]+=1
+
                         diag[k]["last_error"]=str(e)
-                        diag[k]["last_msg_type"]="FEATURE_ERROR"
+
+                        diag[k]["last_msg_type"]=(
+                            "FEATURE_ERROR"
+                        )
 
                         continue
 
@@ -1759,37 +1922,45 @@ async def deriv_ws(k,app):
                     diag[k]["features"]+=1
 
                     # ----------------------------------------
-                    # AI prediction
+                    # PREDICTION
                     # ----------------------------------------
 
-                    c,conf,probs=predict(
-                        k,
-                        f
+                    cls,confidence,probabilities=(
+                        predict(
+                            k,
+                            f
+                        )
                     )
 
-                    last_probs[k]=probs
-                    last_class[k]=c
+                    last_probs[k]=probabilities
 
-                    diag[k]["last_confidence"]=conf
+                    last_class[k]=cls
 
-                    if c!=0:
+                    diag[k]["last_confidence"]=(
+                        confidence
+                    )
+
+                    if cls!=0:
+
                         diag[k]["candidates"]+=1
 
                     # ----------------------------------------
-                    # Signal filter
+                    # SIGNAL FILTER
                     # ----------------------------------------
 
                     if not allowed(
                         k,
-                        c,
-                        conf
+                        cls,
+                        confidence
                     ):
+
                         continue
 
                     direction=(
                         "BUY"
-                        if c==1
-                        else "SELL"
+                        if cls==1
+                        else
+                        "SELL"
                     )
 
                     pending[k].append(
@@ -1798,7 +1969,7 @@ async def deriv_ws(k,app):
                             "price":price,
                             "direction":direction,
                             "features":f,
-                            "confidence":conf
+                            "confidence":confidence
                         }
                     )
 
@@ -1810,8 +1981,8 @@ async def deriv_ws(k,app):
                         app,
                         k,
                         direction,
-                        conf,
-                        probs
+                        confidence,
+                        probabilities
                     )
 
     except asyncio.CancelledError:
@@ -1826,13 +1997,16 @@ async def deriv_ws(k,app):
 
         diag[k]["connected"]=0
         diag[k]["subscribed"]=0
+
         diag[k]["errors"]+=1
 
         diag[k]["last_error"]=(
             f"{type(e).__name__}: {e}"
         )
 
-        diag[k]["last_msg_type"]="WS_EXCEPTION"
+        diag[k]["last_msg_type"]=(
+            "WS_EXCEPTION"
+        )
 
         logging.error(
             "%s websocket exception: %s",
@@ -1852,40 +2026,59 @@ async def deriv_ws(k,app):
 # SIGNAL FILTER
 # ============================================================
 
-def allowed(k,c,conf):
+def allowed(
+    k,
+    cls,
+    confidence
+):
 
     diag[k]["last_block_reason"]=""
 
-    if (
+    if(
         models[k]["samples"]
-        <MIN_TRAINING_SAMPLES
+        <
+        MIN_TRAINING_SAMPLES
     ):
 
         diag[k]["blocked_training"]+=1
-        diag[k]["last_block_reason"]="TRAINING"
+
+        diag[k]["last_block_reason"]=(
+            "TRAINING"
+        )
 
         return False
 
-    if c==0:
+    if cls==0:
 
-        diag[k]["last_block_reason"]="NO_SPIKE"
+        diag[k]["last_block_reason"]=(
+            "NO_SPIKE"
+        )
 
         return False
 
-    if conf<SIGNAL_CONFIDENCE:
+    if confidence<SIGNAL_CONFIDENCE:
 
         diag[k]["blocked_confidence"]+=1
-        diag[k]["last_block_reason"]="CONFIDENCE"
+
+        diag[k]["last_block_reason"]=(
+            "CONFIDENCE"
+        )
 
         return False
 
-    if (
-        time.time()-last_signal[k]
-        <COOLDOWN_SECONDS
+    if(
+        time.time()
+        -
+        last_signal[k]
+        <
+        COOLDOWN_SECONDS
     ):
 
         diag[k]["blocked_cooldown"]+=1
-        diag[k]["last_block_reason"]="COOLDOWN"
+
+        diag[k]["last_block_reason"]=(
+            "COOLDOWN"
+        )
 
         return False
 
@@ -1896,7 +2089,10 @@ def allowed(k,c,conf):
 # AUTO RECONNECT
 # ============================================================
 
-async def start_ws(k,app):
+async def start_ws(
+    k,
+    app
+):
 
     while k in active:
 
@@ -1917,7 +2113,9 @@ async def start_ws(k,app):
                 f"{type(e).__name__}: {e}"
             )
 
-            diag[k]["last_msg_type"]="RECONNECTING"
+            diag[k]["last_msg_type"]=(
+                "RECONNECTING"
+            )
 
             diag[k]["connected"]=0
             diag[k]["subscribed"]=0
@@ -1946,11 +2144,14 @@ def keep_alive():
         )
     )
 
-    class H(BaseHTTPRequestHandler):
+    class Handler(
+        BaseHTTPRequestHandler
+    ):
 
         def do_GET(self):
 
             self.send_response(200)
+
             self.end_headers()
 
             self.wfile.write(
@@ -1959,8 +2160,9 @@ def keep_alive():
 
         def log_message(
             self,
-            *a
+            *args
         ):
+
             pass
 
     HTTPServer(
@@ -1968,7 +2170,7 @@ def keep_alive():
             "0.0.0.0",
             port
         ),
-        H
+        Handler
     ).serve_forever()
 
 
@@ -1979,7 +2181,7 @@ threading.Thread(
 
 
 # ============================================================
-# TELEGRAM BUTTONS
+# BUTTONS
 # ============================================================
 
 def buttons():
@@ -1998,7 +2200,7 @@ def buttons():
 
 
 # ============================================================
-# /START
+# START
 # ============================================================
 
 async def start(
@@ -2014,9 +2216,10 @@ async def start(
 
         active.add(k)
 
-        if (
+        if(
             k not in tasks
-            or tasks[k].done()
+            or
+            tasks[k].done()
         ):
 
             tasks[k]=asyncio.create_task(
@@ -2043,7 +2246,7 @@ async def start(
 
 
 # ============================================================
-# BUTTON
+# BUTTON CONTROL
 # ============================================================
 
 async def button(
@@ -2051,26 +2254,31 @@ async def button(
     context
 ):
 
-    q=update.callback_query
+    query=update.callback_query
 
-    await q.answer()
+    await query.answer()
 
-    k=q.data
+    k=query.data
 
     chat_ids.add(
-        q.message.chat.id
+        query.message.chat.id
     )
 
     if k in active:
 
         active.remove(k)
 
-        t=tasks.get(k)
+        task=tasks.get(k)
 
-        if t and not t.done():
-            t.cancel()
+        if(
+            task
+            and
+            not task.done()
+        ):
 
-        await q.message.reply_text(
+            task.cancel()
+
+        await query.message.reply_text(
             f"❌ {INDICES[k]['name']} унтарлаа."
         )
 
@@ -2078,9 +2286,10 @@ async def button(
 
         active.add(k)
 
-        if (
+        if(
             k not in tasks
-            or tasks[k].done()
+            or
+            tasks[k].done()
         ):
 
             tasks[k]=asyncio.create_task(
@@ -2090,24 +2299,26 @@ async def button(
                 )
             )
 
-        await q.message.reply_text(
+        await query.message.reply_text(
+
             f"✅ {INDICES[k]['name']} идэвхжлээ!\n"
             f"🧠 Training: {models[k]['samples']}\n"
-            f"🎯 Threshold: 40%"
+            "🎯 Threshold: 40%"
         )
 
     try:
 
-        await q.edit_message_reply_markup(
+        await query.edit_message_reply_markup(
             reply_markup=buttons()
         )
 
     except Exception:
+
         pass
 
 
 # ============================================================
-# /STATUS
+# STATUS
 # ============================================================
 
 async def status(
@@ -2133,30 +2344,40 @@ async def status(
 
     for k,info in INDICES.items():
 
-        ok=stats[k]["ok"]
-        fail=stats[k]["fail"]
+        wins=stats[k]["ok"]
+        losses=stats[k]["fail"]
 
-        total=ok+fail
+        total=wins+losses
 
-        wr=(
-            ok/total*100
+        winrate=(
+            wins/total*100
             if total
             else 0
         )
 
-        p=last_probs[k]
+        probabilities=last_probs[k]
 
         symbol=(
             DERIV_SYMBOLS.get(k)
-            or "NOT RESOLVED"
+            or
+            "NOT RESOLVED"
         )
+
+        prediction_names=[
+            "NO SPIKE",
+            "UP SPIKE",
+            "DOWN SPIKE"
+        ]
 
         text=(
 
-            f"{'🟢' if k in active else '⚪'} {info['name']}\n"
+            f"{'🟢' if k in active else '⚪'} "
+            f"{info['name']}\n"
+
             "━━━━━━━━━━━━━━━━━━\n"
 
-            f"🔑 API Symbol: {symbol}\n"
+            f"🔑 API Symbol: "
+            f"{symbol}\n"
 
             f"📡 WebSocket: "
             f"{'CONNECTED ✅' if diag[k]['connected'] else 'OFFLINE ❌'}\n"
@@ -2183,10 +2404,10 @@ async def status(
             f"{models[k]['samples']}\n"
 
             f"🏆 WIN: "
-            f"{ok} | LOSS: {fail}\n"
+            f"{wins} | LOSS: {losses}\n"
 
             f"📈 WinRate: "
-            f"{wr:.1f}%\n"
+            f"{winrate:.1f}%\n"
 
             f"⏳ Pending: "
             f"{len(pending[k])}\n"
@@ -2195,19 +2416,19 @@ async def status(
             f"{diag[k]['candidates']}\n"
 
             f"🔮 Last prediction: "
-            f"{['NO SPIKE','UP SPIKE','DOWN SPIKE'][last_class[k]]}\n"
+            f"{prediction_names[last_class[k]]}\n"
 
             f"🧠 Confidence: "
             f"{diag[k]['last_confidence']*100:.1f}%\n"
 
             f"📈 UP: "
-            f"{p[1]*100:.1f}%\n"
+            f"{probabilities[1]*100:.1f}%\n"
 
             f"📉 DOWN: "
-            f"{p[2]*100:.1f}%\n"
+            f"{probabilities[2]*100:.1f}%\n"
 
             f"⚪ NO SPIKE: "
-            f"{p[0]*100:.1f}%\n"
+            f"{probabilities[0]*100:.1f}%\n"
 
             f"🚨 Signals: "
             f"{diag[k]['signals']}\n"
@@ -2249,7 +2470,44 @@ async def status(
 
 
 # ============================================================
-# /AI
+# SYMBOLS
+# ============================================================
+
+async def symbols(
+    update,
+    context
+):
+
+    chat_ids.add(
+        update.effective_chat.id
+    )
+
+    lines=[
+        "🔎 DERIV SYMBOL MAP",
+        "━━━━━━━━━━━━━━━━━━"
+    ]
+
+    for k,info in INDICES.items():
+
+        lines.append(
+            f"{info['name']}: "
+            f"{DERIV_SYMBOLS.get(k) or 'NOT RESOLVED'}"
+        )
+
+    lines.extend(
+        [
+            "━━━━━━━━━━━━━━━━━━",
+            "ℹ️ Symbols are taken directly from Deriv active_symbols."
+        ]
+    )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# AI STATUS
 # ============================================================
 
 async def ai(
@@ -2261,29 +2519,30 @@ async def ai(
         update.effective_chat.id
     )
 
-    msg=(
+    message=(
         "🧠🔥 AI BRAIN\n"
         "━━━━━━━━━━━━━━━━━━\n"
     )
 
-    for k,v in INDICES.items():
+    for k,info in INDICES.items():
 
-        msg+=(
-            f"\n{v['name']}\n"
+        message+=(
+            f"\n{info['name']}\n"
             f"Learned: {models[k]['samples']}\n"
             f"Live WIN: {stats[k]['ok']}\n"
             f"Live LOSS: {stats[k]['fail']}\n"
         )
 
     await update.message.reply_text(
-        msg+
+        message
+        +
         "\n━━━━━━━━━━━━━━━━━━\n"
         "7 индекс тус бүр өөрийн model-той."
     )
 
 
 # ============================================================
-# /TEST
+# TEST
 # ============================================================
 
 async def test(
@@ -2311,14 +2570,16 @@ async def test(
 
 
 # ============================================================
-# START BOT
+# APPLICATION
 # ============================================================
 
 load_memory()
 
-app=ApplicationBuilder().token(
-    TOKEN
-).build()
+app=(
+    ApplicationBuilder()
+    .token(TOKEN)
+    .build()
+)
 
 app.add_handler(
     CommandHandler(
@@ -2331,6 +2592,13 @@ app.add_handler(
     CommandHandler(
         "status",
         status
+    )
+)
+
+app.add_handler(
+    CommandHandler(
+        "symbols",
+        symbols
     )
 )
 
@@ -2354,6 +2622,10 @@ app.add_handler(
     )
 )
 
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__=="__main__":
 
