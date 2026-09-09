@@ -26,8 +26,8 @@ if not TOKEN:
 
 # ============================================================
 # AI МАНГАС V5 FIX
-# STEP 3 — FEATURE ENGINE
-# RSI STABLE WILDER FIX
+# STEP 4 — FEATURE + PRICE ACTION + MARKET STRUCTURE
+# RSI STABLE WILDER
 # EXACT 7 BOOM / CRASH INDEX
 # ============================================================
 
@@ -59,6 +59,11 @@ INDICES = {
 HISTORY_COUNT = 5000
 TRAINING_COUNT = 300
 TICK_BUFFER = 5000
+
+# Tick-based swing confirmation.
+# This is NOT candle structure.
+SWING_LEFT = 5
+SWING_RIGHT = 5
 
 
 # ============================================================
@@ -115,6 +120,27 @@ features = {
 
 
 # ============================================================
+# MARKET STRUCTURE DATA
+# ============================================================
+
+structure = {
+    symbol: {
+        "swing_high": 0.0,
+        "swing_low": 0.0,
+        "previous_swing_high": 0.0,
+        "previous_swing_low": 0.0,
+        "structure": "NONE",
+        "bos": "NONE",
+        "choch": "NONE",
+        "support": 0.0,
+        "resistance": 0.0,
+        "move_strength": 0.0,
+    }
+    for symbol in INDICES
+}
+
+
+# ============================================================
 # KEEP ALIVE
 # ============================================================
 
@@ -135,7 +161,7 @@ def keep_alive():
             self.end_headers()
 
             self.wfile.write(
-                b"AI MANGAS V5 FIX - FEATURE ENGINE"
+                b"AI MANGAS V5 FIX - MARKET STRUCTURE"
             )
 
         def log_message(self, *args):
@@ -182,6 +208,19 @@ def reset_diag(symbol):
         "direction": "NONE",
     }
 
+    structure[symbol] = {
+        "swing_high": 0.0,
+        "swing_low": 0.0,
+        "previous_swing_high": 0.0,
+        "previous_swing_low": 0.0,
+        "structure": "NONE",
+        "bos": "NONE",
+        "choch": "NONE",
+        "support": 0.0,
+        "resistance": 0.0,
+        "move_strength": 0.0,
+    }
+
     ticks[symbol].clear()
 
 
@@ -219,9 +258,6 @@ def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return None
 
-    # Use the full available history rather than
-    # calculating RSI from only the latest 15 ticks.
-
     changes = []
 
     for i in range(1, len(prices)):
@@ -233,12 +269,8 @@ def calculate_rsi(prices, period=14):
 
         changes.append(change)
 
-
     if len(changes) < period:
         return None
-
-
-    # Initial Wilder average
 
     gains = [
         max(change, 0.0)
@@ -259,9 +291,6 @@ def calculate_rsi(prices, period=14):
         sum(losses)
         / period
     )
-
-
-    # Wilder smoothing over the remaining history
 
     for change in changes[period:]:
 
@@ -291,16 +320,12 @@ def calculate_rsi(prices, period=14):
             + loss
         ) / period
 
-
-    # Final RSI
-
     if average_loss == 0:
 
         if average_gain == 0:
             return 50.0
 
         return 100.0
-
 
     relative_strength = (
         average_gain
@@ -311,9 +336,6 @@ def calculate_rsi(prices, period=14):
         100.0
         / (1.0 + relative_strength)
     )
-
-
-    # Safety clamp
 
     return max(
         0.0,
@@ -438,6 +460,257 @@ def calculate_volatility(prices, period=20):
 
 
 # ============================================================
+# MARKET STRUCTURE
+# TICK-BASED CONFIRMED SWINGS
+# ============================================================
+
+def calculate_market_structure(symbol):
+
+    prices = [
+        float(item[1])
+        for item in ticks[symbol]
+    ]
+
+    minimum_needed = (
+        SWING_LEFT
+        + SWING_RIGHT
+        + 20
+    )
+
+    if len(prices) < minimum_needed:
+        return False
+
+    # --------------------------------------------------------
+    # Find confirmed swing highs/lows
+    # --------------------------------------------------------
+
+    swing_highs = []
+    swing_lows = []
+
+    start = SWING_LEFT
+    end = len(prices) - SWING_RIGHT
+
+    for i in range(start, end):
+
+        current = prices[i]
+
+        left = prices[
+            i - SWING_LEFT:i
+        ]
+
+        right = prices[
+            i + 1:i + SWING_RIGHT + 1
+        ]
+
+        if (
+            current > max(left)
+            and current >= max(right)
+        ):
+            swing_highs.append(
+                (i, current)
+            )
+
+        if (
+            current < min(left)
+            and current <= min(right)
+        ):
+            swing_lows.append(
+                (i, current)
+            )
+
+    # --------------------------------------------------------
+    # Need at least two highs and two lows
+    # --------------------------------------------------------
+
+    if (
+        len(swing_highs) < 2
+        or len(swing_lows) < 2
+    ):
+        return False
+
+    latest_high_index, latest_high = (
+        swing_highs[-1]
+    )
+
+    previous_high_index, previous_high = (
+        swing_highs[-2]
+    )
+
+    latest_low_index, latest_low = (
+        swing_lows[-1]
+    )
+
+    previous_low_index, previous_low = (
+        swing_lows[-2]
+    )
+
+    current_price = prices[-1]
+
+    # --------------------------------------------------------
+    # Structure classification
+    # --------------------------------------------------------
+
+    high_is_higher = (
+        latest_high > previous_high
+    )
+
+    low_is_higher = (
+        latest_low > previous_low
+    )
+
+    high_is_lower = (
+        latest_high < previous_high
+    )
+
+    low_is_lower = (
+        latest_low < previous_low
+    )
+
+    if high_is_higher and low_is_higher:
+
+        structure_name = "HH + HL"
+
+    elif high_is_lower and low_is_lower:
+
+        structure_name = "LH + LL"
+
+    elif high_is_higher:
+
+        structure_name = "HH"
+
+    elif low_is_higher:
+
+        structure_name = "HL"
+
+    elif high_is_lower:
+
+        structure_name = "LH"
+
+    elif low_is_lower:
+
+        structure_name = "LL"
+
+    else:
+
+        structure_name = "RANGE"
+
+
+    # --------------------------------------------------------
+    # Direction from structure
+    # --------------------------------------------------------
+
+    bullish_structure = (
+        high_is_higher
+        and low_is_higher
+    )
+
+    bearish_structure = (
+        high_is_lower
+        and low_is_lower
+    )
+
+
+    # --------------------------------------------------------
+    # BOS
+    #
+    # Current price breaking the latest confirmed
+    # swing level.
+    # --------------------------------------------------------
+
+    bos = "NONE"
+
+    if (
+        current_price > latest_high
+        and latest_high_index < len(prices) - 1
+    ):
+
+        bos = "BULLISH"
+
+    elif (
+        current_price < latest_low
+        and latest_low_index < len(prices) - 1
+    ):
+
+        bos = "BEARISH"
+
+
+    # --------------------------------------------------------
+    # CHoCH
+    #
+    # A structure-direction change:
+    # bullish structure + break below low
+    # bearish structure + break above high
+    #
+    # This is tick-based and intentionally conservative.
+    # --------------------------------------------------------
+
+    choch = "NONE"
+
+    if bearish_structure:
+
+        if current_price > latest_high:
+            choch = "BULLISH"
+
+    elif bullish_structure:
+
+        if current_price < latest_low:
+            choch = "BEARISH"
+
+
+    # --------------------------------------------------------
+    # Support / Resistance
+    # --------------------------------------------------------
+
+    support = latest_low
+    resistance = latest_high
+
+
+    # --------------------------------------------------------
+    # Movement strength
+    #
+    # Distance from recent structure normalized by ATR.
+    # --------------------------------------------------------
+
+    atr = features[symbol]["atr14"]
+
+    if atr and atr > 0:
+
+        distance_to_structure = max(
+            abs(current_price - latest_high),
+            abs(current_price - latest_low)
+        )
+
+        move_strength = (
+            distance_to_structure
+            / atr
+        )
+
+    else:
+
+        move_strength = 0.0
+
+
+    # --------------------------------------------------------
+    # Save
+    # --------------------------------------------------------
+
+    structure[symbol] = {
+        "swing_high": latest_high,
+        "swing_low": latest_low,
+        "previous_swing_high": previous_high,
+        "previous_swing_low": previous_low,
+        "structure": structure_name,
+        "bos": bos,
+        "choch": choch,
+        "support": support,
+        "resistance": resistance,
+        "move_strength": move_strength,
+    }
+
+    return True
+
+
+# ============================================================
 # FEATURE ENGINE
 # ============================================================
 
@@ -552,6 +825,15 @@ def calculate_features(symbol):
     }
 
     diag[symbol]["features"] = 1
+
+
+    # ========================================================
+    # MARKET STRUCTURE
+    # ========================================================
+
+    calculate_market_structure(
+        symbol
+    )
 
     return True
 
@@ -808,6 +1090,7 @@ async def deriv_worker(symbol):
 
                     diag[symbol]["ticks"] += 1
 
+
                     # =================================================
                     # FEATURE CALCULATION
                     # =================================================
@@ -881,8 +1164,9 @@ async def start(
 
     await update.message.reply_text(
         "👹🧠 AI МАНГАС V5 FIX\n\n"
-        "7 INDEX LIVE + FEATURE ENGINE ✅\n\n"
-        "History → Live Tick → Features\n\n"
+        "7 INDEX LIVE + FEATURE ENGINE ✅\n"
+        "MARKET STRUCTURE ON ✅\n\n"
+        "History → Live Tick → Features → Structure\n\n"
         "/status"
     )
 
@@ -899,8 +1183,8 @@ async def status(
     lines = [
         "👹🧠 AI МАНГАС V5 FIX",
         "",
-        "🧠 FEATURE ENGINE STATUS",
-        "========================",
+        "🧠 FEATURE + MARKET STRUCTURE",
+        "==============================",
         ""
     ]
 
@@ -908,6 +1192,7 @@ async def status(
 
         d = diag[symbol]
         f = features[symbol]
+        s = structure[symbol]
 
         ws_status = (
             "ON ✅"
@@ -954,6 +1239,40 @@ async def status(
                     f"Volatility20: {f['volatility20']:.5f}%",
                     f"Trend: {f['trend']}",
                     f"Direction: {f['direction']}",
+                ]
+            )
+
+        # =====================================================
+        # MARKET STRUCTURE STATUS
+        # =====================================================
+
+        if s["swing_high"] > 0:
+
+            lines.extend(
+                [
+                    "",
+                    "📊 MARKET STRUCTURE",
+                    f"Swing High: {s['swing_high']:.5f}",
+                    f"Prev High: {s['previous_swing_high']:.5f}",
+                    f"Swing Low: {s['swing_low']:.5f}",
+                    f"Prev Low: {s['previous_swing_low']:.5f}",
+                    f"Structure: {s['structure']}",
+                    f"BOS: {s['bos']}",
+                    f"CHoCH: {s['choch']}",
+                    f"Support: {s['support']:.5f}",
+                    f"Resistance: {s['resistance']:.5f}",
+                    f"Move Strength: {s['move_strength']:.2f} ATR",
+                ]
+            )
+
+        else:
+
+            lines.extend(
+                [
+                    "",
+                    "📊 MARKET STRUCTURE",
+                    "Structure: WAITING ⏳",
+                    "Swing data: WAITING ⏳",
                 ]
             )
 
@@ -1035,7 +1354,7 @@ async def rawstatus(
         f"{DERIV_PUBLIC_WS}\n\n"
         f"Active workers: "
         f"{len(active)}/7\n\n"
-        "FEATURE ENGINE MODE"
+        "FEATURE + MARKET STRUCTURE MODE"
     )
 
 
