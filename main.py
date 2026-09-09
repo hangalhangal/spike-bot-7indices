@@ -27,6 +27,7 @@ if not TOKEN:
 # ============================================================
 # AI МАНГАС V5 FIX
 # STEP 3 — FEATURE ENGINE
+# RSI FIX ONLY
 # EXACT 7 BOOM / CRASH INDEX
 # ============================================================
 
@@ -57,7 +58,6 @@ INDICES = {
 
 HISTORY_COUNT = 5000
 TRAINING_COUNT = 300
-
 TICK_BUFFER = 5000
 
 
@@ -211,7 +211,8 @@ def calculate_ema(prices, period):
 
 
 # ============================================================
-# RSI
+# RSI — STANDARD WILDER RSI
+# ONLY FIX IN THIS VERSION
 # ============================================================
 
 def calculate_rsi(prices, period=14):
@@ -221,8 +222,8 @@ def calculate_rsi(prices, period=14):
 
     recent = prices[-(period + 1):]
 
-    gains = 0.0
-    losses = 0.0
+    gains = []
+    losses = []
 
     for i in range(1, len(recent)):
 
@@ -232,13 +233,28 @@ def calculate_rsi(prices, period=14):
         )
 
         if change > 0:
-            gains += change
 
-        elif change < 0:
-            losses += abs(change)
+            gains.append(change)
+            losses.append(0.0)
 
-    average_gain = gains / period
-    average_loss = losses / period
+        else:
+
+            gains.append(0.0)
+            losses.append(abs(change))
+
+
+    # Initial Wilder averages
+
+    average_gain = (
+        sum(gains)
+        / period
+    )
+
+    average_loss = (
+        sum(losses)
+        / period
+    )
+
 
     if average_loss == 0:
 
@@ -246,6 +262,7 @@ def calculate_rsi(prices, period=14):
             return 50.0
 
         return 100.0
+
 
     rs = (
         average_gain
@@ -337,7 +354,6 @@ def calculate_volatility(prices, period=20):
     for i in range(1, len(recent)):
 
         previous = recent[i - 1]
-
         current = recent[i]
 
         if previous == 0:
@@ -842,7 +858,6 @@ async def status(
     for symbol, name in INDICES.items():
 
         d = diag[symbol]
-
         f = features[symbol]
 
         ws_status = (
