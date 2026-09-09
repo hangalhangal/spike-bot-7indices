@@ -444,67 +444,88 @@ def calculate_volatility(prices, period=20):
 
 
 # ============================================================
-# ADX / DMI — V3
+# ADX / DMI — V4
 # ============================================================
 #
-# Tick data-гаас synthetic OHLC candles үүсгэнэ.
+# Deriv tick data нь candle биш.
+# Тиймээс эхлээд tick-үүдийг synthetic OHLC candle болгоно.
 #
 # 5 tick = 1 synthetic candle.
 #
-# Дараа нь стандарт ADX/DMI-ийн үндсэн зарчмыг ашиглана:
-#   TR
-#   +DM
-#   -DM
-#   Wilder smoothing
-#   +DI
-#   -DI
-#   DX
-#   ADX
+# Энэ хувилбар:
+#   - Боломжтой бүх tick history-г ашиглана
+#   - Сүүлийн 200-300 tick-ээр хязгаарлахгүй
+#   - True Range ашиглана
+#   - +DM / -DM ашиглана
+#   - Wilder smoothing ашиглана
+#   - DX -> ADX стандарт дарааллаар тооцно
+#   - Artificial 5/95 болон 80 clamp байхгүй
 #
-# Artificial 5/95 болон 80 clamp байхгүй.
+# Зөвхөн ADX/DMI calculation засагдсан.
 # ============================================================
 
 def calculate_adx_dmi(prices, period=14):
 
     TICKS_PER_CANDLE = 5
 
-    minimum_candles = (
-        period * 3 + 5
-    )
-
-    minimum_needed = (
-        minimum_candles
-        * TICKS_PER_CANDLE
-    )
-
-    if len(prices) < minimum_needed:
+    if not isinstance(prices, list):
         return None
 
-    recent_prices = prices[
-        -minimum_needed:
+    if len(prices) < (
+        (period * 2 + 2)
+        * TICKS_PER_CANDLE
+    ):
+        return None
+
+    # --------------------------------------------------------
+    # 1. Бүх боломжтой tick data-г ашиглана.
+    # --------------------------------------------------------
+
+    usable_count = (
+        len(prices)
+        // TICKS_PER_CANDLE
+    ) * TICKS_PER_CANDLE
+
+    if usable_count < (
+        (period * 2 + 2)
+        * TICKS_PER_CANDLE
+    ):
+        return None
+
+    usable_prices = prices[
+        :usable_count
     ]
+
+    # --------------------------------------------------------
+    # 2. Tick -> Synthetic OHLC
+    # --------------------------------------------------------
 
     candles = []
 
-    index = 0
-
-    while (
-        index + TICKS_PER_CANDLE
-        <= len(recent_prices)
+    for start in range(
+        0,
+        len(usable_prices),
+        TICKS_PER_CANDLE
     ):
 
-        chunk = recent_prices[
-            index:
-            index + TICKS_PER_CANDLE
+        chunk = usable_prices[
+            start:
+            start + TICKS_PER_CANDLE
         ]
 
-        if len(chunk) < TICKS_PER_CANDLE:
-            break
+        if len(chunk) != TICKS_PER_CANDLE:
+            continue
 
-        candle_open = chunk[0]
-        candle_high = max(chunk)
-        candle_low = min(chunk)
-        candle_close = chunk[-1]
+        candle_open = float(chunk[0])
+        candle_high = max(
+            float(x)
+            for x in chunk
+        )
+        candle_low = min(
+            float(x)
+            for x in chunk
+        )
+        candle_close = float(chunk[-1])
 
         candles.append({
             "open": candle_open,
@@ -513,16 +534,23 @@ def calculate_adx_dmi(prices, period=14):
             "close": candle_close,
         })
 
-        index += TICKS_PER_CANDLE
-
-    if len(candles) < period * 2 + 2:
+    if len(candles) < (
+        period * 2 + 2
+    ):
         return None
+
+    # --------------------------------------------------------
+    # 3. TR / +DM / -DM
+    # --------------------------------------------------------
 
     tr_values = []
     plus_dm_values = []
     minus_dm_values = []
 
-    for i in range(1, len(candles)):
+    for i in range(
+        1,
+        len(candles)
+    ):
 
         current = candles[i]
         previous = candles[i - 1]
@@ -534,7 +562,8 @@ def calculate_adx_dmi(prices, period=14):
         previous_low = previous["low"]
         previous_close = previous["close"]
 
-        true_range = max(
+        # True Range
+        tr = max(
             current_high - current_low,
             abs(
                 current_high
@@ -546,6 +575,7 @@ def calculate_adx_dmi(prices, period=14):
             ),
         )
 
+        # Directional Movement
         up_move = (
             current_high
             - previous_high
@@ -573,114 +603,161 @@ def calculate_adx_dmi(prices, period=14):
             minus_dm = 0.0
 
         tr_values.append(
-            true_range
+            max(0.0, tr)
         )
 
         plus_dm_values.append(
-            plus_dm
+            max(0.0, plus_dm)
         )
 
         minus_dm_values.append(
-            minus_dm
+            max(0.0, minus_dm)
         )
 
-    if len(tr_values) < period * 2:
+    if len(tr_values) < (
+        period * 2
+    ):
         return None
 
     # --------------------------------------------------------
-    # Initial Wilder averages
+    # 4. Initial Wilder smoothing
     # --------------------------------------------------------
 
-    atr = sum(
+    smoothed_tr = sum(
         tr_values[:period]
-    ) / period
+    )
 
-    plus_dm_avg = sum(
+    smoothed_plus_dm = sum(
         plus_dm_values[:period]
-    ) / period
+    )
 
-    minus_dm_avg = sum(
+    smoothed_minus_dm = sum(
         minus_dm_values[:period]
-    ) / period
+    )
 
     dx_values = []
 
-    plus_di = 0.0
-    minus_di = 0.0
+    latest_plus_di = 0.0
+    latest_minus_di = 0.0
+
+    # Initial DI
+    if smoothed_tr > 0:
+
+        latest_plus_di = (
+            100.0
+            * smoothed_plus_dm
+            / smoothed_tr
+        )
+
+        latest_minus_di = (
+            100.0
+            * smoothed_minus_dm
+            / smoothed_tr
+        )
+
+        di_sum = (
+            latest_plus_di
+            + latest_minus_di
+        )
+
+        if di_sum > 0:
+
+            dx = (
+                100.0
+                * abs(
+                    latest_plus_di
+                    - latest_minus_di
+                )
+                / di_sum
+            )
+
+            dx_values.append(
+                dx
+            )
+
+    # --------------------------------------------------------
+    # 5. Wilder recursive smoothing
+    # --------------------------------------------------------
 
     for i in range(
         period,
         len(tr_values)
     ):
 
-        atr = (
-            (
-                atr
-                * (period - 1)
+        smoothed_tr = (
+            smoothed_tr
+            - (
+                smoothed_tr
+                / period
             )
             + tr_values[i]
-        ) / period
-
-        plus_dm_avg = (
-            (
-                plus_dm_avg
-                * (period - 1)
-            )
-            + plus_dm_values[i]
-        ) / period
-
-        minus_dm_avg = (
-            (
-                minus_dm_avg
-                * (period - 1)
-            )
-            + minus_dm_values[i]
-        ) / period
-
-        if atr > 0:
-
-            plus_di = (
-                100.0
-                * plus_dm_avg
-                / atr
-            )
-
-            minus_di = (
-                100.0
-                * minus_dm_avg
-                / atr
-            )
-
-        else:
-
-            plus_di = 0.0
-            minus_di = 0.0
-
-        denominator = (
-            plus_di
-            + minus_di
         )
 
-        if denominator > 0:
+        smoothed_plus_dm = (
+            smoothed_plus_dm
+            - (
+                smoothed_plus_dm
+                / period
+            )
+            + plus_dm_values[i]
+        )
+
+        smoothed_minus_dm = (
+            smoothed_minus_dm
+            - (
+                smoothed_minus_dm
+                / period
+            )
+            + minus_dm_values[i]
+        )
+
+        if smoothed_tr <= 0:
+
+            latest_plus_di = 0.0
+            latest_minus_di = 0.0
+
+            continue
+
+        latest_plus_di = (
+            100.0
+            * smoothed_plus_dm
+            / smoothed_tr
+        )
+
+        latest_minus_di = (
+            100.0
+            * smoothed_minus_dm
+            / smoothed_tr
+        )
+
+        di_sum = (
+            latest_plus_di
+            + latest_minus_di
+        )
+
+        if di_sum > 0:
 
             dx = (
                 100.0
                 * abs(
-                    plus_di
-                    - minus_di
+                    latest_plus_di
+                    - latest_minus_di
                 )
-                / denominator
+                / di_sum
             )
 
-            dx_values.append(dx)
+            dx_values.append(
+                dx
+            )
+
+    # --------------------------------------------------------
+    # 6. ADX requires enough DX values
+    # --------------------------------------------------------
 
     if len(dx_values) < period:
         return None
 
-    # --------------------------------------------------------
-    # Wilder ADX
-    # --------------------------------------------------------
-
+    # Initial ADX = average first 14 DX
     adx = (
         sum(
             dx_values[:period]
@@ -688,6 +765,7 @@ def calculate_adx_dmi(prices, period=14):
         / period
     )
 
+    # Wilder ADX smoothing
     for dx in dx_values[period:]:
 
         adx = (
@@ -698,27 +776,45 @@ def calculate_adx_dmi(prices, period=14):
             + dx
         ) / period
 
-    # Safety only for numerical floating point.
-    # No artificial trading clamp.
-    plus_di = max(
-        0.0,
-        min(100.0, plus_di)
-    )
+    # --------------------------------------------------------
+    # 7. Final numerical safety only.
+    #
+    # These are NOT trading clamps.
+    # They only prevent floating-point overflow.
+    # --------------------------------------------------------
 
-    minus_di = max(
-        0.0,
-        min(100.0, minus_di)
-    )
+    if not math.isfinite(adx):
+        return None
+
+    if not math.isfinite(
+        latest_plus_di
+    ):
+        return None
+
+    if not math.isfinite(
+        latest_minus_di
+    ):
+        return None
 
     adx = max(
         0.0,
         min(100.0, adx)
     )
 
+    latest_plus_di = max(
+        0.0,
+        min(100.0, latest_plus_di)
+    )
+
+    latest_minus_di = max(
+        0.0,
+        min(100.0, latest_minus_di)
+    )
+
     return {
         "adx": adx,
-        "plus_di": plus_di,
-        "minus_di": minus_di,
+        "plus_di": latest_plus_di,
+        "minus_di": latest_minus_di,
     }
 
 
