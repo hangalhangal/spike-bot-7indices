@@ -290,13 +290,8 @@ async def get_active_symbols(ws):
                 if sym_norm==key_norm or name_norm==name_key_norm or name_norm==_norm_symbol_text(info["name"]):
                     found[key]=symbol
 
-        # Stable identifiers are also the identifiers used by Deriv's
-        # WebSocket tick/ticks_history requests for these markets.
-        for key,stable_symbol in KNOWN_DERIV_SYMBOLS.items():
-            if key not in found:
-                found[key]=stable_symbol
-                logging.warning("%s not matched in active_symbols; using fallback symbol %s",key,stable_symbol)
-
+        # IMPORTANT: do not invent or fallback to a hard-coded symbol.
+        # Only a symbol actually returned by Deriv active_symbols is accepted.
         missing=[k for k in INDICES if not found.get(k)]
         if missing:
             preview=", ".join(f"{s}={n}" for s,n in available[:80])
