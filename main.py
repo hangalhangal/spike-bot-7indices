@@ -1,1980 +1,597 @@
-import os,json,time,math,asyncio,logging,threading
-from http.server import BaseHTTPRequestHandler,HTTPServer
-from collections import deque
+# ============================================================
+# AI MANIAC V5 FIX
+# DERIV SYMBOL AUTO-DETECT PATCH
+# ============================================================
+
+import asyncio
+import json
+import time
 import websockets
-from telegram import Update,InlineKeyboardButton,InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder,CommandHandler,CallbackQueryHandler,ContextTypes
 
-logging.basicConfig(level=logging.INFO,format="%(asctime)s | %(levelname)s | %(message)s")
+DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
-TOKEN=os.getenv("TELEGRAM_TOKEN")
-if not TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN environment variable is missing")
+# ------------------------------------------------------------
+# 7 TARGET INDICES
+# ------------------------------------------------------------
+
+TARGETS = {
+    "BOOM1000": "Boom 1000 Index",
+    "BOOM500": "Boom 500 Index",
+    "BOOM600": "Boom 600 Index",
+    "BOOM900": "Boom 900 Index",
+
+    "CRASH1000": "Crash 1000 Index",
+    "CRASH500": "Crash 500 Index",
+    "CRASH900": "Crash 900 Index",
+}
+
+# API symbol-ууд энд автоматаар орно
+DERIV_SYMBOLS = {}
+
+# ------------------------------------------------------------
+# DIAGNOSTIC
+# ------------------------------------------------------------
+
+for k in TARGETS:
+    if k not in diag:
+        diag[k] = {}
+
+    diag[k].update({
+        "connected": 0,
+        "history": 0,
+        "subscribed": 0,
+        "last_msg_type": "",
+        "last_error": "",
+        "ticks": 0,
+        "features": 0,
+        "candidates": 0,
+        "signals": 0,
+        "blocked_confidence": 0,
+        "blocked_cooldown": 0,
+        "blocked_training": 0,
+        "last_confidence": 0.0,
+    })
 
 
 # ============================================================
-# ЗӨВХӨН ЭДГЭЭР 7 INDEX
+# FIND REAL DERIV SYMBOLS
 # ============================================================
 
-INDICES={
-"BOOM1000":{"name":"Boom 1000 Index","symbol":"BOOM1000","type":"BOOM"},
-"BOOM500":{"name":"Boom 500 Index","symbol":"BOOM500","type":"BOOM"},
-"BOOM600":{"name":"Boom 600 Index","symbol":"BOOM600","type":"BOOM"},
-"BOOM900":{"name":"Boom 900 Index","symbol":"BOOM900","type":"BOOM"},
-"CRASH1000":{"name":"Crash 1000 Index","symbol":"CRASH1000","type":"CRASH"},
-"CRASH500":{"name":"Crash 500 Index","symbol":"CRASH500","type":"CRASH"},
-"CRASH900":{"name":"Crash 900 Index","symbol":"CRASH900","type":"CRASH"}
-}
+async def get_active_symbols(ws):
 
+    DERIV_SYMBOLS.clear()
 
-LIVE_HISTORY=500
-WARMUP_HISTORY=5000
-
-EARLY_MIN_SECONDS=60
-EARLY_MAX_SECONDS=120
-
-SPIKE_THRESHOLD=.10
-SIGNAL_CONFIDENCE=.40
-COOLDOWN_SECONDS=120
-
-LEARNING_RATE=.025
-L2=.0003
-
-MIN_TRAINING_SAMPLES=300
-FEATURE_COUNT=33
-CLASS_COUNT=3
-
-RECENT_RESULTS=100
-MEMORY_FILE="ai_memory_v5_fixed.json"
-
-
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
-active=set()
-chat_ids=set()
-
-ticks_data={
-    k:deque(maxlen=LIVE_HISTORY)
-    for k in INDICES
-}
-
-history_data={
-    k:[]
-    for k in INDICES
-}
-
-models={}
-stats={}
-recent={}
-pending={}
-last_signal={}
-tasks={}
-trained=set()
-
-last_probs={
-    k:[1/3,1/3,1/3]
-    for k in INDICES
-}
-
-last_class={
-    k:0
-    for k in INDICES
-}
-
-diag={}
-
-
-for k in INDICES:
-
-    models[k]={
-        "weights":[
-            [0.0]*FEATURE_COUNT
-            for _ in range(3)
-        ],
-        "bias":[0.0]*3,
-        "samples":0
+    req = {
+        "active_symbols": "brief",
+        "req_id": 9001
     }
 
-    stats[k]={
-        "ok":0,
-        "fail":0,
-        "training":0,
-        "no_spike":0
-    }
+    await ws.send(json.dumps(req))
 
-    recent[k]=deque(maxlen=RECENT_RESULTS)
-    pending[k]=[]
-    last_signal[k]=0.0
+    while True:
 
-    # ========================================================
-    # STATUS-Д ХЭРЭГТЭЙ БҮХ УТГУУДЫГ ЭХЛЭЭД ҮҮСГЭВ
-    # ========================================================
+        raw = await ws.recv()
 
-    diag[k]={
-        "ticks":0,
-        "features":0,
-        "candidates":0,
-        "signals":0,
-
-        "blocked_confidence":0,
-        "blocked_cooldown":0,
-        "blocked_training":0,
-
-        "errors":0,
-        "last_error":"",
-        "last_tick":0.0,
-        "last_confidence":0.0,
-
-        "connected":0,
-        "history":0,
-        "subscribed":0,
-        "last_msg_type":"STARTING"
-    }
-
-
-# ============================================================
-# MEMORY
-# ============================================================
-
-def save_memory():
-
-    try:
-
-        with open(
-            MEMORY_FILE+".tmp",
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            json.dump(
-                {
-                    "models":models,
-                    "stats":stats,
-                    "recent":{
-                        k:list(v)
-                        for k,v in recent.items()
-                    }
-                },
-                f
-            )
-
-        os.replace(
-            MEMORY_FILE+".tmp",
-            MEMORY_FILE
-        )
-
-    except Exception as e:
-
-        logging.error(
-            "memory save: %s",
-            e
-        )
-
-
-def load_memory():
-
-    if not os.path.exists(MEMORY_FILE):
-        return
-
-    try:
-
-        with open(
-            MEMORY_FILE,
-            encoding="utf-8"
-        ) as f:
-
-            d=json.load(f)
-
-        for k in INDICES:
-
-            m=d.get(
-                "models",
-                {}
-            ).get(k)
-
-            if (
-                m
-                and len(m.get("weights",[]))==3
-                and all(
-                    len(x)==FEATURE_COUNT
-                    for x in m["weights"]
-                )
-            ):
-
-                models[k]=m
-
-            if k in d.get("stats",{}):
-
-                stats[k].update(
-                    d["stats"][k]
-                )
-
-            if k in d.get("recent",{}):
-
-                recent[k]=deque(
-                    d["recent"][k],
-                    maxlen=RECENT_RESULTS
-                )
-
-        logging.info(
-            "AI memory loaded"
-        )
-
-    except Exception as e:
-
-        logging.error(
-            "memory load: %s",
-            e
-        )
-
-
-# ============================================================
-# AI FUNCTIONS
-# ============================================================
-
-def softmax(scores):
-
-    m=max(scores)
-
-    ex=[
-        math.exp(
-            max(
-                -50,
-                min(
-                    50,
-                    x-m
-                )
-            )
-        )
-        for x in scores
-    ]
-
-    z=sum(ex)
-
-    return (
-        [x/z for x in ex]
-        if z
-        else
-        [1/3]*3
-    )
-
-
-def dot(a,b):
-
-    return sum(
-        x*y
-        for x,y in zip(a,b)
-    )
-
-
-def predict(k,f):
-
-    m=models[k]
-
-    p=softmax(
-        [
-            dot(
-                m["weights"][c],
-                f
-            )
-            +
-            m["bias"][c]
-
-            for c in range(3)
-        ]
-    )
-
-    c=max(
-        range(3),
-        key=lambda i:p[i]
-    )
-
-    return c,p[c],p
-
-
-def train_model(k,f,y):
-
-    m=models[k]
-
-    p=softmax(
-        [
-            dot(
-                m["weights"][c],
-                f
-            )
-            +
-            m["bias"][c]
-
-            for c in range(3)
-        ]
-    )
-
-    for c in range(3):
-
-        err=(
-            (1.0 if c==y else 0.0)
-            -
-            p[c]
-        )
-
-        for i,x in enumerate(f):
-
-            m["weights"][c][i]+=(
-                LEARNING_RATE*
-                (
-                    err*x
-                    -
-                    L2*m["weights"][c][i]
-                )
-            )
-
-        m["bias"][c]+=(
-            LEARNING_RATE*err
-        )
-
-    m["samples"]+=1
-    stats[k]["training"]+=1
-
-
-# ============================================================
-# FEATURES
-# ============================================================
-
-def features(prices):
-
-    if len(prices)<210:
-        return None
-
-    p=[
-        float(x)
-        for x in prices
-    ]
-
-    cur=p[-1]
-
-    if not cur:
-        return None
-
-    def ret(n):
-
-        o=p[-1-n]
-
-        return (
-            (cur-o)/o*100
-            if o
-            else 0
-        )
-
-    r1,r3,r5,r10,r20,r50,r100,r200=[
-        ret(n)
-        for n in (
-            1,3,5,10,
-            20,50,100,200
-        )
-    ]
-
-    mom=(
-        .30*r5
-        +.25*r10
-        +.20*r20
-        +.15*r50
-        +.10*r100
-    )
-
-    acc=r5-r20
-
-    q=p[-50:]
-
-    ch=[
-        abs(
-            (q[i]-q[i-1])
-            /
-            q[i-1]
-            *
-            100
-        )
-        for i in range(1,len(q))
-        if q[i-1]
-    ]
-
-    vol=(
-        sum(ch)/len(ch)
-        if ch
-        else 0
-    )
-
-    up=sum(
-        p[-i]>p[-i-1]
-        for i in range(1,30)
-    )
-
-    down=sum(
-        p[-i]<p[-i-1]
-        for i in range(1,30)
-    )
-
-    pressure=(up-down)/30
-
-    gains=[]
-    losses=[]
-
-    for i in range(
-        max(1,len(p)-15),
-        len(p)
-    ):
-
-        d=p[i]-p[i-1]
-
-        gains.append(
-            max(d,0)
-        )
-
-        losses.append(
-            max(-d,0)
-        )
-
-    ag=(
-        sum(gains)/len(gains)
-        if gains
-        else 0
-    )
-
-    al=(
-        sum(losses)/len(losses)
-        if losses
-        else 0
-    )
-
-    rsi=(
-        100
-        if ag and not al
-        else
-        (
-            50
-            if not al
-            else
-            100-100/(1+ag/al)
-        )
-    )
-
-    rsi_n=(rsi-50)/50
-
-    mean=lambda n:sum(
-        p[-n:]
-    )/min(
-        n,
-        len(p)
-    )
-
-    e12,e26=mean(12),mean(26)
-
-    macd=(
-        (e12-e26)/cur*100
-    )
-
-    macds=(
-        (e12-mean(9))/cur*100
-    )
-
-    tr=[
-        abs(
-            p[i]-p[i-1]
-        )
-        for i in range(
-            max(1,len(p)-30),
-            len(p)
-        )
-    ]
-
-    atr=(
-        sum(tr)/len(tr)
-        if tr
-        else 0
-    )
-
-    atrp=atr/cur*100
-
-    atrm=(
-        (p[-1]-p[-2])/atr
-        if atr
-        else 0
-    )
-
-    w=p[-20:]
-
-    mm=sum(w)/len(w)
-
-    sd=(
-        sum(
-            (x-mm)**2
-            for x in w
-        )
-        /
-        len(w)
-    )**.5
-
-    bb=(
-        (cur-mm)/(2*sd)
-        if sd
-        else 0
-    )
-
-    s20,s50,s100=(
-        mean(20),
-        mean(50),
-        mean(100)
-    )
-
-    trend=(
-        .5*
-        (
-            (s20-s50)/s50*100
-            if s50
-            else 0
-        )
-        +
-        .3*
-        (
-            (s50-s100)/s100*100
-            if s100
-            else 0
-        )
-        +
-        .2*
-        (
-            (cur-s20)/s20*100
-            if s20
-            else 0
-        )
-    )
-
-    plus=0
-    minus=0
-
-    for i in range(
-        max(1,len(p)-20),
-        len(p)
-    ):
-
-        d=p[i]-p[i-1]
-
-        if d>0:
-            plus+=d
-
-        elif d<0:
-            minus-=d
-
-    dmi=(
-        (plus-minus)/(plus+minus)
-        if plus+minus
-        else 0
-    )
-
-    adx=abs(dmi)
-
-    a=p[-20:]
-    b=p[-40:-20]
-
-    rh,rl=max(a),min(a)
-    ph,pl=max(b),min(b)
-
-    structure=(
-        1
-        if rh>ph and rl>pl
-        else
-        (
-            -1
-            if rh<ph and rl<pl
-            else 0
-        )
-    )
-
-    bos=(
-        1
-        if cur>ph
-        else
-        (
-            -1
-            if cur<pl
-            else 0
-        )
-    )
-
-    ps=(
-        1
-        if p[-20]>p[-40]
-        else
-        (
-            -1
-            if p[-20]<p[-40]
-            else 0
-        )
-    )
-
-    cs=(
-        1
-        if cur>p[-20]
-        else
-        (
-            -1
-            if cur<p[-20]
-            else 0
-        )
-    )
-
-    choch=(
-        cs
-        if cs!=ps
-        else 0
-    )
-
-    look=p[-31:-1]
-
-    hi=max(look)
-    lo=min(look)
-
-    liq=(
-        1
-        if cur>hi
-        else
-        (
-            -1
-            if cur<lo
-            else 0
-        )
-    )
-
-    fvg=(
-        1
-        if p[-5]<p[-3]<p[-1]
-        else
-        (
-            -1
-            if p[-5]>p[-3]>p[-1]
-            else 0
-        )
-    )
-
-    dif=[
-        p[i]-p[i-1]
-        for i in range(
-            max(1,len(p)-15),
-            len(p)
-        )
-    ]
-
-    mx=max(
-        (abs(x) for x in dif),
-        default=0
-    )
-
-    ob=(
-        max(dif,key=abs)/mx
-        if mx
-        else 0
-    )
-
-    old=[
-        abs(p[i]-p[i-1])
-        for i in range(
-            max(1,len(p)-60),
-            max(1,len(p)-30)
-        )
-    ]
-
-    new=[
-        abs(p[i]-p[i-1])
-        for i in range(
-            max(1,len(p)-30),
-            len(p)
-        )
-    ]
-
-    oa=(
-        sum(old)/len(old)
-        if old
-        else 0
-    )
-
-    na=(
-        sum(new)/len(new)
-        if new
-        else 0
-    )
-
-    amd=0
-
-    if oa:
-
-        z=na/oa
-
-        if z>1.3:
-
-            amd=(
-                1
-                if mom>0
-                else -1
-            )
-
-        elif z<.75:
-
-            amd=(
-                .5
-                if mom>0
-                else -.5
-            )
-
-    large=0
-    since=300
-
-    for i in range(
-        max(1,len(p)-300),
-        len(p)
-    ):
-
-        if abs(
-            (p[i]-p[i-1])
-            /
-            p[i-1]
-            *
-            100
-        )>=SPIKE_THRESHOLD:
-
-            large+=1
-            since=0
-
-        else:
-
-            since=min(
-                since+1,
-                300
-            )
-
-    dist=since/300
-    freq=min(large/10,1)
-
-    r10rng=(
-        max(p[-10:])
-        -
-        min(p[-10:])
-    )
-
-    r50rng=(
-        max(p[-50:])
-        -
-        min(p[-50:])
-    )
-
-    comp=(
-        1-min(
-            r10rng/r50rng,
-            1
-        )
-        if r50rng
-        else 0
-    )
-
-    f=[
-        r1,r3,r5,r10,
-        r20,r50,r100,r200,
-        mom,acc,vol,pressure,
-        rsi_n,macd,macds,
-        atrp,atrm,bb,
-        trend,adx,dmi,
-        structure,bos,choch,
-        liq,fvg,ob,amd,
-        dist,freq,comp,
-        r1-r3,
-        pressure*.6+dmi*.4
-    ]
-
-    return [
-        max(
-            -5,
-            min(
-                5,
-                float(x)
-            )
-        )
-        for x in f
-    ]
-
-
-# ============================================================
-# LABEL
-# ============================================================
-
-def label_at(prices,times,i):
-
-    if (
-        i<210
-        or i>=len(prices)-1
-        or not prices[i]
-    ):
-        return None
-
-    t0=times[i]
-    start=prices[i]
-
-    for j in range(
-        i+1,
-        len(prices)
-    ):
-
-        dt=times[j]-t0
-
-        if dt<EARLY_MIN_SECONDS:
+        try:
+            msg = json.loads(raw)
+        except Exception:
             continue
 
-        if dt>EARLY_MAX_SECONDS:
-            break
+        if msg.get("msg_type") == "error":
 
-        move=(
-            (prices[j]-start)
-            /
-            start
-            *
-            100
-        )
+            print("ACTIVE SYMBOL ERROR:", msg)
 
-        if abs(move)>=SPIKE_THRESHOLD:
+            for k in TARGETS:
+                diag[k]["last_error"] = str(
+                    msg.get("error", {}).get("message", "active_symbols error")
+                )
+                diag[k]["last_msg_type"] = "ACTIVE_SYMBOL_ERROR"
 
-            return (
-                1
-                if move>0
-                else 2
-            )
+            return False
 
-    return (
-        0
-        if times[-1]-t0>=EARLY_MAX_SECONDS
-        else None
-    )
-
-
-# ============================================================
-# WARMUP
-# ============================================================
-
-def warmup(k):
-
-    if k in trained:
-        return
-
-    d=history_data[k]
-
-    if len(d)<500:
-        return
-
-    ts=[
-        x[0]
-        for x in d
-    ]
-
-    ps=[
-        x[1]
-        for x in d
-    ]
-
-    pools=[
-        [],
-        [],
-        []
-    ]
-
-    step=max(
-        1,
-        (len(ps)-211)//1200
-    )
-
-    for i in range(
-        210,
-        len(ps)-1,
-        step
-    ):
-
-        y=label_at(
-            ps,
-            ts,
-            i
-        )
-
-        if y is None:
+        if msg.get("msg_type") != "active_symbols":
             continue
+
+        symbols = msg.get("active_symbols", [])
+
+        print("\n========== DERIV ACTIVE SYMBOLS ==========")
+
+        for item in symbols:
+
+            # NEW API
+            symbol = item.get("underlying_symbol")
+            name = item.get("underlying_symbol_name")
+
+            # fallback for legacy response
+            if not symbol:
+                symbol = item.get("symbol")
+
+            if not name:
+                name = item.get("display_name")
+
+            if not symbol or not name:
+                continue
+
+            name_clean = str(name).strip().lower()
+
+            for key, wanted_name in TARGETS.items():
+
+                if name_clean == wanted_name.lower():
+
+                    DERIV_SYMBOLS[key] = symbol
+
+                    diag[key]["last_error"] = ""
+                    diag[key]["last_msg_type"] = "SYMBOL_FOUND"
+
+                    print(
+                        f"FOUND: {key} -> {symbol} -> {name}"
+                    )
+
+        print("==========================================\n")
+
+        # check all 7
+        missing = []
+
+        for key in TARGETS:
+            if key not in DERIV_SYMBOLS:
+                missing.append(key)
+                diag[key]["last_error"] = "ACTIVE SYMBOL NOT FOUND"
+                diag[key]["last_msg_type"] = "SYMBOL_LOOKUP_ERROR"
+
+        if missing:
+
+            print("MISSING SYMBOLS:", missing)
+
+            return False
+
+        print("ALL 7 SYMBOLS FOUND:")
+        print(json.dumps(DERIV_SYMBOLS, indent=2))
+
+        return True
+
+
+# ============================================================
+# SUBSCRIBE ONE INDEX
+# ============================================================
+
+async def subscribe_index(ws, key):
+
+    api_symbol = DERIV_SYMBOLS.get(key)
+
+    if not api_symbol:
+
+        diag[key]["last_error"] = "NO API SYMBOL"
+        diag[key]["last_msg_type"] = "SYMBOL_ERROR"
+
+        return
+
+
+    # --------------------------------------------------------
+    # HISTORY
+    # --------------------------------------------------------
+
+    history_req = {
+        "ticks_history": api_symbol,
+        "end": "latest",
+        "style": "ticks",
+        "count": WARMUP_HISTORY,
+        "subscribe": 0
+    }
+
+    await ws.send(json.dumps(history_req))
+
+    print(
+        f"[HISTORY REQUEST] {key} -> {api_symbol}"
+    )
+
+
+    # --------------------------------------------------------
+    # LIVE TICKS
+    # --------------------------------------------------------
+
+    tick_req = {
+        "ticks": api_symbol,
+        "subscribe": 1
+    }
+
+    await ws.send(json.dumps(tick_req))
+
+    diag[key]["subscribed"] = 1
+
+    print(
+        f"[SUBSCRIBED] {key} -> {api_symbol}"
+    )
+
+
+# ============================================================
+# START WEBSOCKET
+# ============================================================
+
+async def deriv_ws():
+
+    while True:
 
         try:
 
-            f=features(
-                ps[:i+1]
-            )
+            print("\n====================================")
+            print("CONNECTING TO DERIV...")
+            print("====================================\n")
 
-        except Exception as e:
+            async with websockets.connect(
+                DERIV_WS_URL,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=10
+            ) as ws:
 
-            diag[k]["errors"]+=1
-            diag[k]["last_error"]=str(e)
-            f=None
+                # ------------------------------------------------
+                # CONNECTED
+                # ------------------------------------------------
 
-        if f is not None:
+                for k in TARGETS:
 
-            pools[y].append(f)
+                    diag[k]["connected"] = 1
+                    diag[k]["last_error"] = ""
+                    diag[k]["last_msg_type"] = "CONNECTED"
 
-    if not any(pools):
-        return
+                print("DERIV WEBSOCKET CONNECTED")
 
-    pairs=[]
-    n=max(
-        len(x)
-        for x in pools
-    )
 
-    for i in range(n):
+                # ------------------------------------------------
+                # GET REAL SYMBOLS
+                # ------------------------------------------------
 
-        for y in range(3):
+                found = await get_active_symbols(ws)
 
-            if pools[y]:
+                if not found:
 
-                pairs.append(
-                    (
-                        y,
-                        pools[y][
-                            i%len(pools[y])
-                        ]
-                    )
-                )
-
-            if len(pairs)>=MIN_TRAINING_SAMPLES:
-                break
-
-        if len(pairs)>=MIN_TRAINING_SAMPLES:
-            break
-
-    if len(pairs)<MIN_TRAINING_SAMPLES:
-
-        for y,pool in enumerate(pools):
-
-            for f in pool:
-
-                pairs.append(
-                    (y,f)
-                )
-
-                if len(pairs)>=MIN_TRAINING_SAMPLES:
-                    break
-
-            if len(pairs)>=MIN_TRAINING_SAMPLES:
-                break
-
-    for y,f in pairs:
-
-        train_model(
-            k,
-            f,
-            y
-        )
-
-    trained.add(k)
-
-    save_memory()
-
-    logging.info(
-        "%s warm-up labels NO=%d UP=%d DOWN=%d trained=%d",
-        k,
-        *[len(x) for x in pools],
-        models[k]["samples"]
-    )
-
-
-# ============================================================
-# EVALUATION
-# ============================================================
-
-def eval_one(pred,data,now):
-
-    t0=pred["time"]
-    start=pred["price"]
-    found=None
-
-    for ts,price in data:
-
-        dt=ts-t0
-
-        if dt<60:
-            continue
-
-        if dt>120:
-            break
-
-        move=(
-            (price-start)
-            /
-            start
-            *
-            100
-        )
-
-        if abs(move)>=SPIKE_THRESHOLD:
-
-            found=(
-                1
-                if move>0
-                else 2
-            )
-
-            break
-
-    if found is None:
-
-        return (
-            None
-            if now-t0<120
-            else 0
-        )
-
-    wanted=(
-        1
-        if pred["direction"]=="BUY"
-        else 2
-    )
-
-    return (
-        1
-        if found==wanted
-        else -1
-    )
-
-
-async def evaluate(k,now):
-
-    if not pending[k]:
-        return
-
-    data=list(
-        ticks_data[k]
-    )
-
-    rem=[]
-    changed=False
-
-    for p in pending[k]:
-
-        r=eval_one(
-            p,
-            data,
-            now
-        )
-
-        if r is None:
-
-            rem.append(p)
-            continue
-
-        changed=True
-
-        if r==1:
-
-            stats[k]["ok"]+=1
-            recent[k].append(1)
-
-            actual=(
-                1
-                if p["direction"]=="BUY"
-                else 2
-            )
-
-        elif r==-1:
-
-            stats[k]["fail"]+=1
-            recent[k].append(0)
-
-            actual=(
-                2
-                if p["direction"]=="BUY"
-                else 1
-            )
-
-        else:
-
-            stats[k]["fail"]+=1
-            stats[k]["no_spike"]+=1
-            recent[k].append(0)
-
-            actual=0
-
-        train_model(
-            k,
-            p["features"],
-            actual
-        )
-
-    pending[k]=rem
-
-    if changed:
-        save_memory()
-
-
-# ============================================================
-# SIGNAL FILTER
-# ============================================================
-
-def allowed(k,c,conf):
-
-    if models[k]["samples"]<MIN_TRAINING_SAMPLES:
-
-        diag[k]["blocked_training"]+=1
-
-        return False
-
-    if c==0:
-        return False
-
-    if conf<SIGNAL_CONFIDENCE:
-
-        diag[k]["blocked_confidence"]+=1
-
-        return False
-
-    if (
-        time.time()-last_signal[k]
-        <
-        COOLDOWN_SECONDS
-    ):
-
-        diag[k]["blocked_cooldown"]+=1
-
-        return False
-
-    return True
-
-
-# ============================================================
-# TELEGRAM SIGNAL
-# ============================================================
-
-async def send_signal(
-    app,
-    k,
-    direction,
-    conf,
-    probs
-):
-
-    info=INDICES[k]
-
-    text=(
-        "🧠🔥 AI MANIAC V5 FIX\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"📊 {info['name']}\n"
-        f"⚡ {'BUY NOW 🟢' if direction=='BUY' else 'SELL NOW 🔴'}\n"
-        f"🎯 {'UP SPIKE 📈' if direction=='BUY' else 'DOWN SPIKE 📉'}\n"
-        "⏱️ Expected: 60–120 sec after signal\n"
-        f"🧠 Confidence: {conf*100:.1f}%\n"
-        f"📚 Training: {models[k]['samples']}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"UP: {probs[1]*100:.1f}%\n"
-        f"DOWN: {probs[2]*100:.1f}%\n"
-        f"NO SPIKE: {probs[0]*100:.1f}%\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ Prediction only — guaranteed profit биш."
-    )
-
-    for cid in list(chat_ids):
-
-        try:
-
-            await app.bot.send_message(
-                chat_id=cid,
-                text=text
-            )
-
-        except Exception as e:
-
-            logging.error(
-                "Telegram send: %s",
-                e
-            )
-
-
-# ============================================================
-# DERIV WEBSOCKET
-# ============================================================
-
-async def deriv_ws(symbol,k,app):
-
-    uri=(
-        "wss://ws.binaryws.com/"
-        "websockets/v3?app_id=1089"
-    )
-
-    diag[k]["last_error"]=""
-
-    try:
-
-        async with websockets.connect(
-            uri,
-            ping_interval=20,
-            ping_timeout=20,
-            close_timeout=10
-        ) as ws:
-
-            diag[k]["connected"]=1
-            diag[k]["last_msg_type"]="CONNECTED"
-
-            logging.info(
-                "%s CONNECTED",
-                k
-            )
-
-            await ws.send(
-                json.dumps({
-                    "ticks_history":symbol,
-                    "count":WARMUP_HISTORY,
-                    "end":"latest",
-                    "style":"ticks",
-                    "subscribe":0
-                })
-            )
-
-            diag[k]["last_msg_type"]="HISTORY_REQUESTED"
-
-            await ws.send(
-                json.dumps({
-                    "ticks":symbol,
-                    "subscribe":1
-                })
-            )
-
-            diag[k]["subscribed"]=1
-            diag[k]["last_msg_type"]="SUBSCRIBED"
-
-            while k in active:
-
-                raw=await ws.recv()
-
-                msg=json.loads(raw)
-
-                if "error" in msg:
-
-                    err=msg["error"]
-
-                    diag[k]["errors"]+=1
-
-                    diag[k]["last_error"]=str(
-                        err.get(
-                            "message",
-                            err
-                        )
+                    print(
+                        "ERROR: Could not find all 7 target symbols."
                     )
 
-                    diag[k]["last_msg_type"]="ERROR"
-
-                    logging.error(
-                        "%s Deriv error: %s",
-                        k,
-                        diag[k]["last_error"]
-                    )
-
+                    await asyncio.sleep(5)
                     continue
 
 
-                # HISTORY
-                if "history" in msg:
+                # ------------------------------------------------
+                # SUBSCRIBE ALL 7
+                # ------------------------------------------------
 
-                    ps=msg["history"].get(
-                        "prices",
-                        []
-                    )
-
-                    ts=msg["history"].get(
-                        "times",
-                        []
-                    )
-
-                    history_data[k]=[
-                        (
-                            float(ts[i]),
-                            float(x)
-                        )
-
-                        for i,x in enumerate(ps)
-
-                        if i<len(ts)
-                    ]
-
-                    diag[k]["history"]=len(
-                        history_data[k]
-                    )
-
-                    diag[k]["last_msg_type"]="HISTORY"
-
-                    for item in history_data[k][
-                        -LIVE_HISTORY:
-                    ]:
-
-                        ticks_data[k].append(
-                            item
-                        )
-
-                    await asyncio.to_thread(
-                        warmup,
-                        k
-                    )
-
-
-                # LIVE TICK
-                if "tick" in msg:
-
-                    t=msg["tick"]
+                for key in TARGETS:
 
                     try:
 
-                        price=float(
-                            t["quote"]
-                        )
-
-                        timestamp=float(
-                            t.get(
-                                "epoch",
-                                time.time()
-                            )
+                        await subscribe_index(
+                            ws,
+                            key
                         )
 
                     except Exception as e:
 
-                        diag[k]["errors"]+=1
-
-                        diag[k]["last_error"]=(
-                            f"tick parse: {e}"
+                        diag[key]["last_error"] = str(e)
+                        diag[key]["last_msg_type"] = "SUBSCRIBE_ERROR"
+                        diag[key]["errors"] = (
+                            diag[key].get("errors", 0) + 1
                         )
 
-                        diag[k]["last_msg_type"]=(
-                            "TICK_PARSE_ERROR"
+                        print(
+                            f"[SUBSCRIBE ERROR] {key}: {e}"
                         )
+
+
+                # ------------------------------------------------
+                # RECEIVE DATA
+                # ------------------------------------------------
+
+                async for raw in ws:
+
+                    try:
+                        msg = json.loads(raw)
+
+                    except Exception:
+                        continue
+
+
+                    msg_type = msg.get("msg_type")
+
+
+                    # ====================================================
+                    # ERROR
+                    # ====================================================
+
+                    if msg_type == "error":
+
+                        error = msg.get("error", {})
+
+                        message = error.get(
+                            "message",
+                            "Unknown Deriv error"
+                        )
+
+                        echo = msg.get("echo_req", {})
+
+                        bad_symbol = (
+                            echo.get("ticks")
+                            or echo.get("ticks_history")
+                            or ""
+                        )
+
+                        print(
+                            "\nDERIV ERROR:",
+                            message,
+                            "SYMBOL:",
+                            bad_symbol
+                        )
+
+
+                        # find matching key
+                        for key, symbol in DERIV_SYMBOLS.items():
+
+                            if symbol == bad_symbol:
+
+                                diag[key]["errors"] = (
+                                    diag[key].get("errors", 0) + 1
+                                )
+
+                                diag[key]["last_error"] = message
+                                diag[key]["last_msg_type"] = "ERROR"
 
                         continue
 
-                    diag[k]["ticks"]+=1
-                    diag[k]["last_tick"]=timestamp
-                    diag[k]["last_msg_type"]="LIVE_TICK"
 
-                    ticks_data[k].append(
-                        (
-                            timestamp,
+                    # ====================================================
+                    # HISTORY
+                    # ====================================================
+
+                    if msg_type in (
+                        "history",
+                        "candles"
+                    ):
+
+                        echo = msg.get(
+                            "echo_req",
+                            {}
+                        )
+
+                        api_symbol = (
+                            echo.get("ticks_history")
+                            or ""
+                        )
+
+                        key = None
+
+                        for k, symbol in DERIV_SYMBOLS.items():
+
+                            if symbol == api_symbol:
+                                key = k
+                                break
+
+                        if key is None:
+                            continue
+
+
+                        history = msg.get(
+                            "history",
+                            {}
+                        )
+
+                        prices = history.get(
+                            "prices",
+                            []
+                        )
+
+                        if prices:
+
+                            history_data[key].clear()
+
+                            history_data[key].extend(
+                                float(x)
+                                for x in prices
+                            )
+
+                            diag[key]["history"] = len(
+                                history_data[key]
+                            )
+
+                            diag[key]["last_msg_type"] = "HISTORY"
+
+
+                            print(
+                                f"[HISTORY] {key}: "
+                                f"{len(prices)} ticks"
+                            )
+
+                        continue
+
+
+                    # ====================================================
+                    # LIVE TICK
+                    # ====================================================
+
+                    if msg_type == "tick":
+
+                        tick = msg.get(
+                            "tick",
+                            {}
+                        )
+
+                        api_symbol = tick.get(
+                            "symbol"
+                        )
+
+                        quote = tick.get(
+                            "quote"
+                        )
+
+                        if api_symbol is None:
+                            continue
+
+                        if quote is None:
+                            continue
+
+
+                        # find key
+                        key = None
+
+                        for k, symbol in DERIV_SYMBOLS.items():
+
+                            if symbol == api_symbol:
+                                key = k
+                                break
+
+                        if key is None:
+                            continue
+
+
+                        price = float(quote)
+
+
+                        # ------------------------------------------------
+                        # STORE TICK
+                        # ------------------------------------------------
+
+                        history_data[key].append(
                             price
                         )
-                    )
 
-                    ps=[
-                        x[1]
-                        for x in ticks_data[k]
-                    ]
+                        if len(history_data[key]) > LIVE_HISTORY:
 
-                    if len(ps)<210:
-                        continue
-
-                    await evaluate(
-                        k,
-                        timestamp
-                    )
-
-                    try:
-
-                        f=features(ps)
-
-                    except Exception as e:
-
-                        diag[k]["errors"]+=1
-                        diag[k]["last_error"]=str(e)
-                        diag[k]["last_msg_type"]="FEATURE_ERROR"
-
-                        continue
-
-                    if f is None:
-                        continue
-
-                    diag[k]["features"]+=1
-
-                    c,conf,probs=predict(
-                        k,
-                        f
-                    )
-
-                    last_probs[k]=probs
-                    last_class[k]=c
-
-                    diag[k]["last_confidence"]=conf
-
-                    if c!=0:
-                        diag[k]["candidates"]+=1
-
-                    if not allowed(
-                        k,
-                        c,
-                        conf
-                    ):
-                        continue
-
-                    direction=(
-                        "BUY"
-                        if c==1
-                        else "SELL"
-                    )
-
-                    pending[k].append(
-                        {
-                            "time":timestamp,
-                            "price":price,
-                            "direction":direction,
-                            "features":f,
-                            "confidence":conf
-                        }
-                    )
-
-                    last_signal[k]=time.time()
-
-                    diag[k]["signals"]+=1
-
-                    await send_signal(
-                        app,
-                        k,
-                        direction,
-                        conf,
-                        probs
-                    )
+                            del history_data[key][
+                                :-LIVE_HISTORY
+                            ]
 
 
-    except asyncio.CancelledError:
-
-        raise
-
-    except Exception as e:
-
-        # WS дахин холбогдох үед статусыг зөв харуулах
-        diag[k]["connected"]=0
-
-        diag[k]["errors"]+=1
-
-        diag[k]["last_error"]=(
-            f"{type(e).__name__}: {e}"
-        )
-
-        diag[k]["last_msg_type"]="WS_EXCEPTION"
-
-        logging.error(
-            "%s websocket exception: %s",
-            k,
-            e
-        )
-
-        raise
+                        diag[key]["ticks"] += 1
+                        diag[key]["last_tick"] = time.time()
+                        diag[key]["history"] = len(
+                            history_data[key]
+                        )
+                        diag[key]["last_msg_type"] = "TICK"
 
 
-# ============================================================
-# AUTO RECONNECT
-# ============================================================
+                        # ------------------------------------------------
+                        # EXISTING V5 AI PIPELINE
+                        # ------------------------------------------------
+                        #
+                        # ЭНДЭЭС ДООШИХ ХЭСЭГТ
+                        # ЧИНИЙ ОДООГИЙН V5 КОДНЫ
+                        #
+                        # features()
+                        # predict()
+                        # allowed()
+                        # pending
+                        # send_signal()
+                        #
+                        # ЛОГИК ХЭВЭЭР ҮЛДЭНЭ.
+                        #
+                        # ------------------------------------------------
 
-async def start_ws(
-    symbol,
-    k,
-    app
-):
+                        if len(history_data[key]) < 50:
+                            continue
 
-    while k in active:
 
-        try:
+                        try:
 
-            await deriv_ws(
-                symbol,
-                k,
-                app
-            )
+                            X = features(
+                                history_data[key]
+                            )
 
-        except asyncio.CancelledError:
+                            if X is None:
+                                continue
 
-            return
+                            diag[key]["features"] += 1
+
+
+                            # Existing V5 prediction
+                            probs = predict(
+                                models[key],
+                                X
+                            )
+
+                            c = int(
+                                max(
+                                    range(
+                                        len(probs)
+                                    ),
+                                    key=lambda i:
+                                    probs[i]
+                                )
+                            )
+
+                            conf = float(
+                                probs[c]
+                            )
+
+
+                            last_probs[key] = probs
+                            last_class[key] = c
+
+                            diag[key][
+                                "last_confidence"
+                            ] = conf
+
+
+                            # ------------------------------------------------
+                            # KEEP EXISTING V5 DECISION LOGIC
+                            # ------------------------------------------------
+
+                            if allowed(
+                                key,
+                                c,
+                                conf
+                            ):
+
+                                diag[key][
+                                    "candidates"
+                                ] += 1
+
+                                # ЭНД ЧИНИЙ ОДООГИЙН V5
+                                # PENDING / SIGNAL ЛОГИК
+                                # ҮРГЭЛЖИЛНЭ.
+
+                                # ЖИШЭЭ:
+                                #
+                                # pending[key] = {
+                                #     "class": c,
+                                #     "confidence": conf,
+                                #     "time": time.time()
+                                # }
+                                #
+                                # send_signal(...)
+                                #
+                                # Энэ хэсгийг одоогийн V5
+                                # кодноосоо хэвээр нь үлдээнэ.
+
+                        except Exception as e:
+
+                            diag[key]["errors"] = (
+                                diag[key].get(
+                                    "errors",
+                                    0
+                                ) + 1
+                            )
+
+                            diag[key][
+                                "last_error"
+                            ] = str(e)
+
+                            diag[key][
+                                "last_msg_type"
+                            ] = "AI_ERROR"
+
 
         except Exception as e:
 
-            diag[k]["connected"]=0
-
-            diag[k]["last_error"]=(
-                f"{type(e).__name__}: {e}"
-            )
-
-            diag[k]["last_msg_type"]="RECONNECTING"
-
-            logging.error(
-                "%s websocket: %s",
-                k,
+            print(
+                "\nWEBSOCKET CONNECTION ERROR:",
                 e
             )
 
-            if k in active:
+            for key in TARGETS:
 
-                await asyncio.sleep(5)
+                diag[key]["connected"] = 0
+                diag[key]["subscribed"] = 0
+                diag[key]["last_msg_type"] = "DISCONNECTED"
+                diag[key]["last_error"] = str(e)
 
-
-# ============================================================
-# KEEP ALIVE
-# ============================================================
-
-def keep_alive():
-
-    port=int(
-        os.environ.get(
-            "PORT",
-            "10000"
-        )
-    )
-
-    class H(BaseHTTPRequestHandler):
-
-        def do_GET(self):
-
-            self.send_response(200)
-            self.end_headers()
-
-            self.wfile.write(
-                b"AI MANIAC V5 FIX LIVE"
-            )
-
-        def log_message(
-            self,
-            *a
-        ):
-            pass
-
-    HTTPServer(
-        ("0.0.0.0",port),
-        H
-    ).serve_forever()
-
-
-threading.Thread(
-    target=keep_alive,
-    daemon=True
-).start()
-
-
-# ============================================================
-# BUTTONS
-# ============================================================
-
-def buttons():
-
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    f"{'✅' if k in active else '❌'} {v['name']}",
-                    callback_data=k
-                )
-            ]
-
-            for k,v in INDICES.items()
-        ]
-    )
-
-
-# ============================================================
-# /START
-# ============================================================
-
-async def start(
-    update,
-    context
-):
-
-    chat_ids.add(
-        update.effective_chat.id
-    )
-
-    for k in INDICES:
-
-        active.add(k)
-
-        if (
-            k not in tasks
-            or tasks[k].done()
-        ):
-
-            tasks[k]=asyncio.create_task(
-                start_ws(
-                    INDICES[k]["symbol"],
-                    k,
-                    context.application
-                )
-            )
-
-    await update.message.reply_text(
-        "🧠🔥 AI MANIAC V5 FIX\n\n"
-        "ЗӨВХӨН 7 BOOM / CRASH INDEX\n\n"
-        "✅ 7 индекс бүгд идэвхжлээ.\n"
-        "📡 Live tick data авч байна.\n"
-        "🧠 Balanced historical warm-up ON.\n"
-        "🔄 Live result бүрийн дараа online learning ON.\n"
-        "💾 Persistent memory ON.\n"
-        "🎯 Diagnostic threshold: 40%.\n\n"
-        "⚠️ Prediction only.",
-        reply_markup=buttons()
-    )
-
-
-# ============================================================
-# BUTTON
-# ============================================================
-
-async def button(
-    update,
-    context
-):
-
-    q=update.callback_query
-
-    await q.answer()
-
-    k=q.data
-
-    chat_ids.add(
-        q.message.chat.id
-    )
-
-    if k in active:
-
-        active.remove(k)
-
-        t=tasks.get(k)
-
-        if t and not t.done():
-            t.cancel()
-
-        diag[k]["connected"]=0
-        diag[k]["last_msg_type"]="STOPPED"
-
-        await q.message.reply_text(
-            f"❌ {INDICES[k]['name']} унтарлаа."
-        )
-
-    else:
-
-        active.add(k)
-
-        if (
-            k not in tasks
-            or tasks[k].done()
-        ):
-
-            tasks[k]=asyncio.create_task(
-                start_ws(
-                    INDICES[k]["symbol"],
-                    k,
-                    context.application
-                )
-            )
-
-        await q.message.reply_text(
-            f"✅ {INDICES[k]['name']} идэвхжлээ!\n"
-            f"🧠 Training: {models[k]['samples']}\n"
-            f"🎯 Threshold: 40%"
-        )
-
-    try:
-
-        await q.edit_message_reply_markup(
-            reply_markup=buttons()
-        )
-
-    except Exception:
-        pass
-
-
-# ============================================================
-# /STATUS
-# ============================================================
-
-async def status(
-    update,
-    context
-):
-
-    chat_ids.add(
-        update.effective_chat.id
-    )
-
-    # --------------------------------------------------------
-    # HEADER
-    # --------------------------------------------------------
-
-    await update.message.reply_text(
-        "🧠🔥 AI MANIAC V5 FIX STATUS\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 Active: {len(active)}/7\n"
-        "📡 Live tick engine: ON\n"
-        "🧠 Balanced warm-up: ON\n"
-        "🔄 Online learning: ON\n"
-        "💾 Persistent memory: ON\n"
-        "🎯 Confidence filter: 40%\n"
-        "━━━━━━━━━━━━━━━━━━"
-    )
-
-
-    # --------------------------------------------------------
-    # 7 INDEX — ТУС БҮРД НЬ ТУСДАА MESSAGE
-    # --------------------------------------------------------
-
-    for k,info in INDICES.items():
-
-        ok=stats[k]["ok"]
-        fail=stats[k]["fail"]
-
-        total=ok+fail
-
-        wr=(
-            ok/total*100
-            if total
-            else 0
-        )
-
-        p=last_probs.get(
-            k,
-            [1/3,1/3,1/3]
-        )
-
-        cls=last_class.get(
-            k,
-            0
-        )
-
-        class_names=[
-            "NO SPIKE",
-            "UP SPIKE",
-            "DOWN SPIKE"
-        ]
-
-        d=diag[k]
-
-        msg=(
-            f"{'🟢' if k in active else '⚪'} "
-            f"{info['name']}\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-
-            f"📡 WebSocket: "
-            f"{'CONNECTED ✅' if d.get('connected',0) else 'OFF ❌'}\n"
-
-            f"📚 History: "
-            f"{d.get('history',0)}\n"
-
-            f"📥 Subscribed: "
-            f"{'YES ✅' if d.get('subscribed',0) else 'NO ❌'}\n"
-
-            f"🔄 Last message: "
-            f"{d.get('last_msg_type','-')}\n"
-
-            f"📊 Ticks stored: "
-            f"{len(ticks_data[k])}/{LIVE_HISTORY}\n"
-
-            f"⚡ Live ticks: "
-            f"{d.get('ticks',0)}\n"
-
-            f"🧩 Features: "
-            f"{d.get('features',0)}\n"
-
-            f"🧠 AI Training: "
-            f"{models[k].get('samples',0)}\n"
-
-            f"🏆 WIN: {ok} | LOSS: {fail}\n"
-
-            f"📈 WinRate: "
-            f"{wr:.1f}%\n"
-
-            f"⏳ Pending: "
-            f"{len(pending[k])}\n"
-
-            f"🎯 Candidates: "
-            f"{d.get('candidates',0)}\n"
-
-            f"🔮 Last prediction: "
-            f"{class_names[cls] if 0 <= cls < 3 else 'UNKNOWN'}\n"
-
-            f"🧠 Confidence: "
-            f"{d.get('last_confidence',0)*100:.1f}%\n"
-
-            f"📈 UP: "
-            f"{p[1]*100:.1f}%\n"
-
-            f"📉 DOWN: "
-            f"{p[2]*100:.1f}%\n"
-
-            f"⚪ NO SPIKE: "
-            f"{p[0]*100:.1f}%\n"
-
-            f"🚨 Signals: "
-            f"{d.get('signals',0)}\n"
-
-            f"❌ Errors: "
-            f"{d.get('errors',0)}\n"
-
-            f"⛔ Blocked confidence: "
-            f"{d.get('blocked_confidence',0)}\n"
-
-            f"⏱️ Blocked cooldown: "
-            f"{d.get('blocked_cooldown',0)}\n"
-
-            f"🧠 Blocked training: "
-            f"{d.get('blocked_training',0)}\n"
-
-            f"⚠️ Last error: "
-            f"{d.get('last_error') or '-'}\n"
-
-            "━━━━━━━━━━━━━━━━━━"
-        )
-
-        try:
-
-            await update.message.reply_text(
-                msg
-            )
-
-        except Exception as e:
-
-            logging.error(
-                "STATUS SEND ERROR %s: %s",
-                k,
-                e
-            )
-
-
-    # --------------------------------------------------------
-    # FINAL
-    # --------------------------------------------------------
-
-    await update.message.reply_text(
-        "🧠🔥 AI MANIAC V5 FIX\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 Active: {len(active)}/7\n"
-        "📡 Live tick engine: ON\n"
-        "🧠 Balanced warm-up: ON\n"
-        "🔄 Online learning: ON\n"
-        "💾 Persistent memory: ON\n"
-        "🎯 Confidence filter: 40%\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "✅ /status COMPLETE"
-    )
-
-
-# ============================================================
-# /AI
-# ============================================================
-
-async def ai(
-    update,
-    context
-):
-
-    chat_ids.add(
-        update.effective_chat.id
-    )
-
-    msg=(
-        "🧠🔥 AI BRAIN\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-    )
-
-    for k,v in INDICES.items():
-
-        msg+=(
-            f"\n{v['name']}\n"
-            f"Learned: {models[k]['samples']}\n"
-            f"Live WIN: {stats[k]['ok']}\n"
-            f"Live LOSS: {stats[k]['fail']}\n"
-        )
-
-    await update.message.reply_text(
-        msg+
-        "\n━━━━━━━━━━━━━━━━━━\n"
-        "7 индекс тус бүр өөрийн model-той."
-    )
-
-
-# ============================================================
-# /TEST
-# ============================================================
-
-async def test(
-    update,
-    context
-):
-
-    chat_ids.add(
-        update.effective_chat.id
-    )
-
-    await update.message.reply_text(
-        "🧪 AI MANIAC V5 FIX TEST\n\n"
-        "Telegram: OK ✅\n"
-        "7 Index engine: OK ✅\n"
-        "Historical warm-up: ON ✅\n"
-        "Balanced training: ON ✅\n"
-        "Online learning: ON ✅\n"
-        "Persistent memory: ON ✅\n"
-        "Diagnostic 40% filter: ON ✅\n"
-        "Auto /start activation: ON ✅\n\n"
-        "⚠️ TEST MESSAGE ONLY"
-    )
-
-
-# ============================================================
-# START BOT
-# ============================================================
-
-load_memory()
-
-app=(
-    ApplicationBuilder()
-    .token(TOKEN)
-    .build()
-)
-
-app.add_handler(
-    CommandHandler(
-        "start",
-        start
-    )
-)
-
-app.add_handler(
-    CommandHandler(
-        "status",
-        status
-    )
-)
-
-app.add_handler(
-    CommandHandler(
-        "ai",
-        ai
-    )
-)
-
-app.add_handler(
-    CommandHandler(
-        "test",
-        test
-    )
-)
-
-app.add_handler(
-    CallbackQueryHandler(
-        button
-    )
-)
-
-
-if __name__=="__main__":
-
-    logging.info(
-        "🔥 AI MANIAC V5 FIX STARTING — ONLY 7 INDICES"
-    )
-
-    app.run_polling()
+            await asyncio.sleep(5)
