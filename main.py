@@ -1,2939 +1,809 @@
 import os
 import json
+import time
+import math
 import asyncio
 import logging
 import threading
-import math
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import deque
 
 import websockets
-
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
 )
 
-logging.basicConfig(level=logging.INFO)
+# ============================================================
+# AI MANIAC V5
+# ONLY 7 BOOM / CRASH INDICES
+# TELEGRAM SIGNAL ONLY
+# ============================================================
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-
-if not TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN missing")
-
-DERIV_PUBLIC_WS = (
-    "wss://api.derivws.com/"
-    "trading/v1/options/ws/public"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN environment variable is missing")
+
+# ONLY THESE 7
 INDICES = {
-    "BOOM1000": "Boom 1000 Index",
-    "BOOM500": "Boom 500 Index",
-    "BOOM600": "Boom 600 Index",
-    "BOOM900": "Boom 900 Index",
-    "CRASH1000": "Crash 1000 Index",
-    "CRASH500": "Crash 500 Index",
-    "CRASH900": "Crash 900 Index",
+    "BOOM1000": {"name": "Boom 1000 Index", "symbol": "BOOM1000", "type": "BOOM"},
+    "BOOM500": {"name": "Boom 500 Index", "symbol": "BOOM500", "type": "BOOM"},
+    "BOOM600": {"name": "Boom 600 Index", "symbol": "BOOM600", "type": "BOOM"},
+    "BOOM900": {"name": "Boom 900 Index", "symbol": "BOOM900", "type": "BOOM"},
+    "CRASH1000": {"name": "Crash 1000 Index", "symbol": "CRASH1000", "type": "CRASH"},
+    "CRASH500": {"name": "Crash 500 Index", "symbol": "CRASH500", "type": "CRASH"},
+    "CRASH900": {"name": "Crash 900 Index", "symbol": "CRASH900", "type": "CRASH"},
 }
 
-HISTORY_COUNT = 5000
-TRAINING_COUNT = 300
-TICK_BUFFER = 5000
+# ---------------- SETTINGS ----------------
+LIVE_HISTORY = 500
+WARMUP_HISTORY = 5000
 
-SWING_LEFT = 5
-SWING_RIGHT = 5
+EARLY_MIN_SECONDS = 60
+EARLY_MAX_SECONDS = 120
+SPIKE_THRESHOLD = 0.10
 
-MOVE_STRENGTH_LOOKBACK = 20
+# Only high-confidence predictions can become Telegram signals.
+SIGNAL_CONFIDENCE = 0.40
+MIN_SIGNAL_CONFIDENCE = 0.40
+MAX_SIGNAL_CONFIDENCE = 0.40
+
+# Avoid repeated signals from the same index.
+COOLDOWN_SECONDS = 120
+
+# Online learning
+LEARNING_RATE = 0.025
+L2 = 0.0003
+
+# The model is allowed to signal only after enough labeled examples.
+MIN_TRAINING_SAMPLES = 300
+
+# Do not trust recent win-rate until enough live outcomes exist.
+MIN_RECENT_RESULTS = 40
+RECENT_RESULTS = 100
+
+MEMORY_FILE = "ai_memory_v5.json"
+
+# 0 = NO SPIKE, 1 = UP SPIKE, 2 = DOWN SPIKE
+FEATURE_COUNT = 33
+CLASS_COUNT = 3
 
 active = set()
-tasks = {}
+chat_ids = set()
 
-ticks = {
-    symbol: deque(maxlen=TICK_BUFFER)
-    for symbol in INDICES
+ticks_data = {
+    k: deque(maxlen=LIVE_HISTORY) for k in INDICES
 }
 
-diag = {
-    symbol: {
-        "stage": "IDLE",
-        "connected": 0,
-        "subscribed": 0,
-        "ticks": 0,
-        "history": 0,
-        "training": 0,
-        "features": 0,
-        "error": "",
-    }
-    for symbol in INDICES
+# Full historical data used only during warm-up.
+history_data = {
+    k: [] for k in INDICES
 }
 
-features = {
-    symbol: {
-        "price": 0.0,
-        "ema20": 0.0,
-        "ema50": 0.0,
-        "rsi14": 0.0,
-        "atr14": 0.0,
-        "momentum10": 0.0,
-        "volatility20": 0.0,
-        "trend": "NEUTRAL",
-        "direction": "NONE",
+models = {}
+learn_stats = {}
+recent_results = {}
+pending_predictions = {}
+last_signal_time = {}
+ws_tasks = {}
+history_trained = set()
+
+diagnostics = {}
+
+for key in INDICES:
+    models[key] = {
+        "weights": [[0.0] * FEATURE_COUNT for _ in range(CLASS_COUNT)],
+        "bias": [0.0] * CLASS_COUNT,
+        "samples": 0,
     }
-    for symbol in INDICES
-}
-
-structure = {
-    symbol: {
-        "swing_high": 0.0,
-        "swing_low": 0.0,
-        "previous_swing_high": 0.0,
-        "previous_swing_low": 0.0,
-        "structure": "NONE",
-        "bos": "NONE",
-        "choch": "NONE",
-        "support": 0.0,
-        "resistance": 0.0,
-        "move_strength": 0.0,
-        "swing_high_count": 0,
-        "swing_low_count": 0,
-        "structure_error": "",
-    }
-    for symbol in INDICES
-}
-
-advanced = {
-    symbol: {
-        "adx14": 0.0,
-        "plus_di": 0.0,
-        "minus_di": 0.0,
-        "ob_bullish": 0,
-        "ob_bearish": 0,
-        "fvg_bullish": 0,
-        "fvg_bearish": 0,
-        "spike_score": 0.0,
-        "spike_direction": "NONE",
-        "compression": 0.0,
-        "range_expansion": 0.0,
-    }
-    for symbol in INDICES
-}
-
-score = {
-    symbol: {
-        "buy": 0.0,
-        "sell": 0.0,
-        "trend": 0.0,
-        "rsi": 0.0,
-        "momentum": 0.0,
-        "volatility": 0.0,
-        "structure": 0.0,
-        "bos_choch": 0.0,
-        "sr": 0.0,
-        "move_strength": 0.0,
-        "adx": 0.0,
-        "order_block": 0.0,
-        "fvg": 0.0,
-        "spike": 0.0,
-        "decision": "WAIT",
-        "strength": "LOW",
-    }
-    for symbol in INDICES
-}
-
-
-def keep_alive():
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            "10000"
-        )
-    )
-
-    class Handler(
-        BaseHTTPRequestHandler
-    ):
-
-        def do_GET(self):
-
-            self.send_response(200)
-            self.end_headers()
-
-            self.wfile.write(
-                b"AI MANGAS V5 FIX - SCORE ENGINE V1"
-            )
-
-        def log_message(
-            self,
-            *args
-        ):
-            pass
-
-    HTTPServer(
-        ("0.0.0.0", port),
-        Handler
-    ).serve_forever()
-
-
-threading.Thread(
-    target=keep_alive,
-    daemon=True
-).start()
-
-
-def reset_diag(symbol):
-
-    diag[symbol] = {
-        "stage": "IDLE",
-        "connected": 0,
-        "subscribed": 0,
-        "ticks": 0,
-        "history": 0,
-        "training": 0,
-        "features": 0,
-        "error": "",
-    }
-
-    features[symbol] = {
-        "price": 0.0,
-        "ema20": 0.0,
-        "ema50": 0.0,
-        "rsi14": 0.0,
-        "atr14": 0.0,
-        "momentum10": 0.0,
-        "volatility20": 0.0,
-        "trend": "NEUTRAL",
-        "direction": "NONE",
-    }
-
-    structure[symbol] = {
-        "swing_high": 0.0,
-        "swing_low": 0.0,
-        "previous_swing_high": 0.0,
-        "previous_swing_low": 0.0,
-        "structure": "NONE",
-        "bos": "NONE",
-        "choch": "NONE",
-        "support": 0.0,
-        "resistance": 0.0,
-        "move_strength": 0.0,
-        "swing_high_count": 0,
-        "swing_low_count": 0,
-        "structure_error": "",
-    }
-
-    advanced[symbol] = {
-        "adx14": 0.0,
-        "plus_di": 0.0,
-        "minus_di": 0.0,
-        "ob_bullish": 0,
-        "ob_bearish": 0,
-        "fvg_bullish": 0,
-        "fvg_bearish": 0,
-        "spike_score": 0.0,
-        "spike_direction": "NONE",
-        "compression": 0.0,
-        "range_expansion": 0.0,
-    }
-
-    score[symbol] = {
-        "buy": 0.0,
-        "sell": 0.0,
-        "trend": 0.0,
-        "rsi": 0.0,
-        "momentum": 0.0,
-        "volatility": 0.0,
-        "structure": 0.0,
-        "bos_choch": 0.0,
-        "sr": 0.0,
-        "move_strength": 0.0,
-        "adx": 0.0,
-        "order_block": 0.0,
-        "fvg": 0.0,
-        "spike": 0.0,
-        "decision": "WAIT",
-        "strength": "LOW",
-    }
-
-    ticks[symbol].clear()
-
-
-def calculate_ema(
-    prices,
-    period
-):
-
-    if len(prices) < period:
-        return None
-
-    values = prices[-period:]
-
-    ema = sum(values) / period
-
-    multiplier = (
-        2.0
-        / (period + 1.0)
-    )
-
-    for price in values[1:]:
-
-        ema = (
-            (price - ema)
-            * multiplier
-            + ema
-        )
-
-    return ema
-
-
-def calculate_rsi(
-    prices,
-    period=14
-):
-
-    TICKS_PER_CANDLE = 20
-
-    if not isinstance(
-        prices,
-        list
-    ):
-        return None
-
-    clean_prices = []
-
-    for price in prices:
-
-        try:
-
-            value = float(price)
-
-            if math.isfinite(value):
-                clean_prices.append(value)
-
-        except Exception:
-            continue
-
-    if len(clean_prices) < (
-        (period + 1)
-        * TICKS_PER_CANDLE
-    ):
-        return None
-
-    usable_count = (
-        len(clean_prices)
-        // TICKS_PER_CANDLE
-    ) * TICKS_PER_CANDLE
-
-    if usable_count < (
-        (period + 1)
-        * TICKS_PER_CANDLE
-    ):
-        return None
-
-    usable_prices = clean_prices[
-        :usable_count
-    ]
-
-    candle_closes = []
-
-    for start in range(
-        0,
-        len(usable_prices),
-        TICKS_PER_CANDLE
-    ):
-
-        chunk = usable_prices[
-            start:
-            start + TICKS_PER_CANDLE
-        ]
-
-        if len(chunk) != TICKS_PER_CANDLE:
-            continue
-
-        candle_closes.append(
-            chunk[-1]
-        )
-
-    if len(candle_closes) < period + 1:
-        return None
-
-    changes = []
-
-    for i in range(
-        1,
-        len(candle_closes)
-    ):
-
-        changes.append(
-            candle_closes[i]
-            - candle_closes[i - 1]
-        )
-
-    if len(changes) < period:
-        return None
-
-    gains = [
-        max(change, 0.0)
-        for change in changes[:period]
-    ]
-
-    losses = [
-        max(-change, 0.0)
-        for change in changes[:period]
-    ]
-
-    average_gain = (
-        sum(gains)
-        / period
-    )
-
-    average_loss = (
-        sum(losses)
-        / period
-    )
-
-    for change in changes[period:]:
-
-        gain = max(
-            change,
-            0.0
-        )
-
-        loss = max(
-            -change,
-            0.0
-        )
-
-        average_gain = (
-            (
-                average_gain
-                * (period - 1)
-            )
-            + gain
-        ) / period
-
-        average_loss = (
-            (
-                average_loss
-                * (period - 1)
-            )
-            + loss
-        ) / period
-
-    if average_loss == 0:
-
-        if average_gain == 0:
-            return 50.0
-
-        return 100.0
-
-    relative_strength = (
-        average_gain
-        / average_loss
-    )
-
-    rsi = (
-        100.0
-        - (
-            100.0
-            / (
-                1.0
-                + relative_strength
-            )
-        )
-    )
-
-    return max(
-        0.0,
-        min(
-            100.0,
-            rsi
-        )
-    )
-
-
-def calculate_atr(
-    prices,
-    period=14
-):
-
-    if len(prices) < period + 1:
-        return None
-
-    recent = prices[
-        -(period + 1):
-    ]
-
-    true_ranges = []
-
-    for i in range(
-        1,
-        len(recent)
-    ):
-
-        current = recent[i]
-        previous = recent[i - 1]
-
-        true_range = abs(
-            current - previous
-        )
-
-        true_ranges.append(
-            true_range
-        )
-
-    if not true_ranges:
-        return None
-
-    return (
-        sum(
-            true_ranges[-period:]
-        )
-        / min(
-            period,
-            len(true_ranges)
-        )
-    )
-
-
-def calculate_momentum(
-    prices,
-    period=10
-):
-
-    if len(prices) <= period:
-        return None
-
-    old_price = prices[
-        -period - 1
-    ]
-
-    current_price = prices[-1]
-
-    if old_price == 0:
-        return 0.0
-
-    return (
-        (
-            current_price
-            - old_price
-        )
-        / old_price
-    ) * 100.0
-
-
-def calculate_volatility(
-    prices,
-    period=20
-):
-
-    if len(prices) < period + 1:
-        return None
-
-    changes = []
-
-    recent = prices[
-        -(period + 1):
-    ]
-
-    for i in range(
-        1,
-        len(recent)
-    ):
-
-        previous = recent[i - 1]
-        current = recent[i]
-
-        if previous == 0:
-            continue
-
-        change = (
-            current - previous
-        ) / previous
-
-        changes.append(change)
-
-    if len(changes) < 2:
-        return 0.0
-
-    mean = (
-        sum(changes)
-        / len(changes)
-    )
-
-    variance = (
-        sum(
-            (x - mean) ** 2
-            for x in changes
-        )
-        / len(changes)
-    )
-
-    return (
-        math.sqrt(variance)
-        * 100.0
-    )
-
-
-def calculate_adx_dmi(
-    prices,
-    period=14
-):
-
-    TICKS_PER_CANDLE = 20
-
-    if not isinstance(
-        prices,
-        list
-    ):
-        return None
-
-    clean_prices = []
-
-    for price in prices:
-
-        try:
-
-            value = float(price)
-
-            if math.isfinite(value):
-                clean_prices.append(value)
-
-        except Exception:
-            continue
-
-    minimum_candles = (
-        period * 3 + 5
-    )
-
-    if len(clean_prices) < (
-        minimum_candles
-        * TICKS_PER_CANDLE
-    ):
-        return None
-
-    usable_count = (
-        len(clean_prices)
-        // TICKS_PER_CANDLE
-    ) * TICKS_PER_CANDLE
-
-    if usable_count < (
-        minimum_candles
-        * TICKS_PER_CANDLE
-    ):
-        return None
-
-    usable_prices = clean_prices[
-        :usable_count
-    ]
-
-    candles = []
-
-    for start in range(
-        0,
-        len(usable_prices),
-        TICKS_PER_CANDLE
-    ):
-
-        chunk = usable_prices[
-            start:
-            start + TICKS_PER_CANDLE
-        ]
-
-        if len(chunk) != TICKS_PER_CANDLE:
-            continue
-
-        candles.append({
-            "open": chunk[0],
-            "high": max(chunk),
-            "low": min(chunk),
-            "close": chunk[-1],
-        })
-
-    if len(candles) < (
-        period * 3 + 2
-    ):
-        return None
-
-    tr_values = []
-    plus_dm_values = []
-    minus_dm_values = []
-
-    for i in range(
-        1,
-        len(candles)
-    ):
-
-        current = candles[i]
-        previous = candles[i - 1]
-
-        current_high = current["high"]
-        current_low = current["low"]
-
-        previous_high = previous["high"]
-        previous_low = previous["low"]
-        previous_close = previous["close"]
-
-        tr = max(
-            current_high
-            - current_low,
-
-            abs(
-                current_high
-                - previous_close
-            ),
-
-            abs(
-                current_low
-                - previous_close
-            ),
-        )
-
-        up_move = (
-            current_high
-            - previous_high
-        )
-
-        down_move = (
-            previous_low
-            - current_low
-        )
-
-        if (
-            up_move > down_move
-            and up_move > 0
-        ):
-            plus_dm = up_move
-        else:
-            plus_dm = 0.0
-
-        if (
-            down_move > up_move
-            and down_move > 0
-        ):
-            minus_dm = down_move
-        else:
-            minus_dm = 0.0
-
-        tr_values.append(
-            max(
-                0.0,
-                tr
-            )
-        )
-
-        plus_dm_values.append(
-            max(
-                0.0,
-                plus_dm
-            )
-        )
-
-        minus_dm_values.append(
-            max(
-                0.0,
-                minus_dm
-            )
-        )
-
-    if len(tr_values) < (
-        period * 2 + 1
-    ):
-        return None
-
-    smoothed_tr = sum(
-        tr_values[:period]
-    )
-
-    smoothed_plus_dm = sum(
-        plus_dm_values[:period]
-    )
-
-    smoothed_minus_dm = sum(
-        minus_dm_values[:period]
-    )
-
-    dx_values = []
-
-    latest_plus_di = 0.0
-    latest_minus_di = 0.0
-
-    if smoothed_tr > 0:
-
-        latest_plus_di = (
-            100.0
-            * smoothed_plus_dm
-            / smoothed_tr
-        )
-
-        latest_minus_di = (
-            100.0
-            * smoothed_minus_dm
-            / smoothed_tr
-        )
-
-        di_sum = (
-            latest_plus_di
-            + latest_minus_di
-        )
-
-        if di_sum > 0:
-
-            dx_values.append(
-                100.0
-                * abs(
-                    latest_plus_di
-                    - latest_minus_di
-                )
-                / di_sum
-            )
-
-    for i in range(
-        period,
-        len(tr_values)
-    ):
-
-        smoothed_tr = (
-            smoothed_tr
-            - (
-                smoothed_tr
-                / period
-            )
-            + tr_values[i]
-        )
-
-        smoothed_plus_dm = (
-            smoothed_plus_dm
-            - (
-                smoothed_plus_dm
-                / period
-            )
-            + plus_dm_values[i]
-        )
-
-        smoothed_minus_dm = (
-            smoothed_minus_dm
-            - (
-                smoothed_minus_dm
-                / period
-            )
-            + minus_dm_values[i]
-        )
-
-        if smoothed_tr <= 0:
-            continue
-
-        latest_plus_di = (
-            100.0
-            * smoothed_plus_dm
-            / smoothed_tr
-        )
-
-        latest_minus_di = (
-            100.0
-            * smoothed_minus_dm
-            / smoothed_tr
-        )
-
-        di_sum = (
-            latest_plus_di
-            + latest_minus_di
-        )
-
-        if di_sum > 0:
-
-            dx = (
-                100.0
-                * abs(
-                    latest_plus_di
-                    - latest_minus_di
-                )
-                / di_sum
-            )
-
-            if math.isfinite(dx):
-                dx_values.append(dx)
-
-    if len(dx_values) < period:
-        return None
-
-    adx = (
-        sum(
-            dx_values[:period]
-        )
-        / period
-    )
-
-    for dx in dx_values[period:]:
-
-        adx = (
-            (
-                adx
-                * (period - 1)
-            )
-            + dx
-        ) / period
-
-    if not math.isfinite(adx):
-        return None
-
-    if not math.isfinite(
-        latest_plus_di
-    ):
-        return None
-
-    if not math.isfinite(
-        latest_minus_di
-    ):
-        return None
-
-    return {
-        "adx": max(
-            0.0,
-            min(
-                100.0,
-                adx
-            )
-        ),
-
-        "plus_di": max(
-            0.0,
-            min(
-                100.0,
-                latest_plus_di
-            )
-        ),
-
-        "minus_di": max(
-            0.0,
-            min(
-                100.0,
-                latest_minus_di
-            )
-        ),
-    }
-
-
-def calculate_market_structure(symbol):
-
-    prices = [
-        float(item[1])
-        for item in ticks[symbol]
-    ]
-
-    minimum_needed = (
-        SWING_LEFT
-        + SWING_RIGHT
-        + 20
-    )
-
-    if len(prices) < minimum_needed:
-
-        structure[symbol][
-            "structure_error"
-        ] = (
-            f"WAITING: PRICE DATA "
-            f"{len(prices)}/{minimum_needed}"
-        )
-
-        return False
-
-    swing_highs = []
-    swing_lows = []
-
-    start = SWING_LEFT
-    end = (
-        len(prices)
-        - SWING_RIGHT
-    )
-
-    for i in range(
-        start,
-        end
-    ):
-
-        current = prices[i]
-
-        left = prices[
-            i - SWING_LEFT:i
-        ]
-
-        right = prices[
-            i + 1:
-            i + SWING_RIGHT + 1
-        ]
-
-        if (
-            current > max(left)
-            and current >= max(right)
-        ):
-            swing_highs.append(
-                (i, current)
-            )
-
-        if (
-            current < min(left)
-            and current <= min(right)
-        ):
-            swing_lows.append(
-                (i, current)
-            )
-
-    high_count = len(
-        swing_highs
-    )
-
-    low_count = len(
-        swing_lows
-    )
-
-    structure[symbol][
-        "swing_high_count"
-    ] = high_count
-
-    structure[symbol][
-        "swing_low_count"
-    ] = low_count
-
-    if (
-        high_count < 2
-        or low_count < 2
-    ):
-
-        missing = []
-
-        if high_count < 2:
-
-            missing.append(
-                f"HIGH {high_count}/2"
-            )
-
-        if low_count < 2:
-
-            missing.append(
-                f"LOW {low_count}/2"
-            )
-
-        structure[symbol][
-            "structure_error"
-        ] = (
-            "WAITING: "
-            + ", ".join(missing)
-        )
-
-        return False
-
-    (
-        latest_high_index,
-        latest_high
-    ) = swing_highs[-1]
-
-    (
-        previous_high_index,
-        previous_high
-    ) = swing_highs[-2]
-
-    (
-        latest_low_index,
-        latest_low
-    ) = swing_lows[-1]
-
-    (
-        previous_low_index,
-        previous_low
-    ) = swing_lows[-2]
-
-    current_price = prices[-1]
-
-    high_is_higher = (
-        latest_high
-        > previous_high
-    )
-
-    low_is_higher = (
-        latest_low
-        > previous_low
-    )
-
-    high_is_lower = (
-        latest_high
-        < previous_high
-    )
-
-    low_is_lower = (
-        latest_low
-        < previous_low
-    )
-
-    if (
-        high_is_higher
-        and low_is_higher
-    ):
-
-        structure_name = "HH + HL"
-
-    elif (
-        high_is_lower
-        and low_is_lower
-    ):
-
-        structure_name = "LH + LL"
-
-    elif (
-        high_is_higher
-        and low_is_lower
-    ):
-
-        structure_name = "HH + LL"
-
-    elif (
-        high_is_lower
-        and low_is_higher
-    ):
-
-        structure_name = "LH + HL"
-
-    else:
-
-        structure_name = "RANGE"
-
-    bos = "NONE"
-    choch = "NONE"
-
-    if (
-        high_is_higher
-        and low_is_higher
-    ):
-
-        if current_price < latest_low:
-
-            choch = "BEARISH"
-
-        elif current_price > latest_high:
-
-            bos = "BULLISH"
-
-    elif (
-        high_is_lower
-        and low_is_lower
-    ):
-
-        if current_price > latest_high:
-
-            choch = "BULLISH"
-
-        elif current_price < latest_low:
-
-            bos = "BEARISH"
-
-    atr = features[symbol]["atr14"]
-
-    if atr and atr > 0:
-
-        lookback = min(
-            MOVE_STRENGTH_LOOKBACK,
-            len(prices) - 1
-        )
-
-        start_price = (
-            prices[
-                -lookback - 1
-            ]
-        )
-
-        recent_price = prices[-1]
-
-        recent_move = abs(
-            recent_price
-            - start_price
-        )
-
-        normalized_range = (
-            atr
-            * math.sqrt(lookback)
-        )
-
-        if normalized_range > 0:
-
-            move_strength = (
-                recent_move
-                / normalized_range
-            )
-
-        else:
-
-            move_strength = 0.0
-
-    else:
-
-        move_strength = 0.0
-
-    structure[symbol] = {
-
-        "swing_high": latest_high,
-        "swing_low": latest_low,
-
-        "previous_swing_high":
-            previous_high,
-
-        "previous_swing_low":
-            previous_low,
-
-        "structure":
-            structure_name,
-
-        "bos":
-            bos,
-
-        "choch":
-            choch,
-
-        "support":
-            latest_low,
-
-        "resistance":
-            latest_high,
-
-        "move_strength":
-            move_strength,
-
-        "swing_high_count":
-            high_count,
-
-        "swing_low_count":
-            low_count,
-
-        "structure_error":
-            "",
-    }
-
-    return True
-
-
-def calculate_order_block(symbol):
-
-    prices = [
-        float(item[1])
-        for item in ticks[symbol]
-    ]
-
-    if len(prices) < 30:
-
-        return {
-            "bullish": 0,
-            "bearish": 0,
+    learn_stats[key] = {"ok": 0, "fail": 0, "training": 0, "no_spike": 0, "early": 0}
+    recent_results[key] = deque(maxlen=RECENT_RESULTS)
+    pending_predictions[key] = []
+    last_signal_time[key] = 0.0
+    diagnostics[key] = {"ticks": 0, "features": 0, "candidates": 0, "signals": 0, "blocked_confidence": 0, "blocked_direction": 0, "blocked_cooldown": 0, "blocked_training": 0, "errors": 0, "last_error": "", "last_tick": 0.0, "last_confidence": 0.0}
+
+
+# ============================================================
+# MEMORY
+# ============================================================
+
+def save_memory():
+    try:
+        data = {
+            "models": models,
+            "stats": learn_stats,
+            "recent": {k: list(v) for k, v in recent_results.items()},
         }
-
-    atr = features[symbol]["atr14"]
-
-    if not atr or atr <= 0:
-
-        return {
-            "bullish": 0,
-            "bearish": 0,
-        }
-
-    recent = prices[-30:]
-
-    bullish = 0
-    bearish = 0
-
-    for i in range(
-        5,
-        len(recent) - 3
-    ):
-
-        base = recent[i]
-        future = recent[i + 3]
-
-        move = future - base
-
-        if move >= atr * 2.0:
-            bullish = 1
-
-        if move <= -atr * 2.0:
-            bearish = 1
-
-    return {
-        "bullish": bullish,
-        "bearish": bearish,
-    }
-
-
-def calculate_fvg(symbol):
-
-    prices = [
-        float(item[1])
-        for item in ticks[symbol]
-    ]
-
-    if len(prices) < 10:
-
-        return {
-            "bullish": 0,
-            "bearish": 0,
-        }
-
-    atr = features[symbol]["atr14"]
-
-    if not atr or atr <= 0:
-
-        return {
-            "bullish": 0,
-            "bearish": 0,
-        }
-
-    bullish = 0
-    bearish = 0
-
-    start = max(
-        2,
-        len(prices) - 30
-    )
-
-    for i in range(
-        start,
-        len(prices)
-    ):
-
-        p1 = prices[i - 2]
-        p2 = prices[i - 1]
-        p3 = prices[i]
-
-        move1 = p2 - p1
-        move2 = p3 - p2
-
-        if (
-            move1 > 0
-            and move2 > 0
-            and (
-                p3 - p1
-            ) >= atr * 2.0
-        ):
-
-            bullish = 1
-
-        if (
-            move1 < 0
-            and move2 < 0
-            and (
-                p1 - p3
-            ) >= atr * 2.0
-        ):
-
-            bearish = 1
-
-    return {
-        "bullish": bullish,
-        "bearish": bearish,
-    }
-
-
-def calculate_spike_analysis(symbol):
-
-    prices = [
-        float(item[1])
-        for item in ticks[symbol]
-    ]
-
-    if len(prices) < 50:
-
-        return {
-            "score": 0.0,
-            "direction": "NONE",
-            "compression": 0.0,
-            "expansion": 0.0,
-        }
-
-    atr = features[symbol]["atr14"]
-
-    if not atr or atr <= 0:
-
-        return {
-            "score": 0.0,
-            "direction": "NONE",
-            "compression": 0.0,
-            "expansion": 0.0,
-        }
-
-    short_changes = []
-
-    for i in range(
-        max(
-            1,
-            len(prices) - 10
-        ),
-        len(prices)
-    ):
-
-        short_changes.append(
-            abs(
-                prices[i]
-                - prices[i - 1]
-            )
-        )
-
-    long_changes = []
-
-    for i in range(
-        max(
-            1,
-            len(prices) - 40
-        ),
-        len(prices)
-    ):
-
-        long_changes.append(
-            abs(
-                prices[i]
-                - prices[i - 1]
-            )
-        )
-
-    short_avg = (
-        sum(short_changes)
-        / max(
-            1,
-            len(short_changes)
-        )
-    )
-
-    long_avg = (
-        sum(long_changes)
-        / max(
-            1,
-            len(long_changes)
-        )
-    )
-
-    if long_avg > 0:
-
-        compression_ratio = (
-            short_avg
-            / long_avg
-        )
-
-    else:
-
-        compression_ratio = 1.0
-
-    # ========================================================
-    # RANGE EXPANSION NORMALIZATION FIX
-    # Compare the latest 10-tick movement with previous
-    # 10-tick movement blocks.
-    # This avoids comparing a 10-tick move against a
-    # 1-tick ATR.
-    # ========================================================
-
-    block_size = 10
-
-    recent_changes = []
-
-    for i in range(
-        len(prices) - block_size,
-        len(prices)
-    ):
-
-        recent_changes.append(
-            abs(
-                prices[i]
-                - prices[i - 1]
-            )
-        )
-
-    recent_range = sum(
-        recent_changes
-    )
-
-    baseline_ranges = []
-
-    baseline_start = max(
-        1,
-        len(prices) - 40
-    )
-
-    baseline_end = (
-        len(prices) - block_size
-    )
-
-    for block_start in range(
-        baseline_start,
-        baseline_end,
-        block_size
-    ):
-
-        block_end = min(
-            block_start + block_size,
-            baseline_end
-        )
-
-        block_changes = []
-
-        for i in range(
-            block_start,
-            block_end
-        ):
-
-            block_changes.append(
-                abs(
-                    prices[i]
-                    - prices[i - 1]
-                )
-            )
-
-        if block_changes:
-
-            baseline_ranges.append(
-                sum(block_changes)
-            )
-
-    if baseline_ranges:
-
-        baseline_range = (
-            sum(baseline_ranges)
-            / len(baseline_ranges)
-        )
-
-    else:
-
-        baseline_range = 0.0
-
-    if baseline_range > 0:
-
-        expansion_ratio = (
-            recent_range
-            / baseline_range
-        )
-
-    else:
-
-        expansion_ratio = 1.0
-
-    symbol_is_boom = symbol.startswith(
-        "BOOM"
-    )
-
-    symbol_is_crash = symbol.startswith(
-        "CRASH"
-    )
-
-    score_value = 0.0
-    direction = "NONE"
-
-    if compression_ratio < 0.75:
-
-        score_value += 20.0
-
-    elif compression_ratio < 0.90:
-
-        score_value += 10.0
-
-    if expansion_ratio >= 3.0:
-
-        score_value += 25.0
-
-    elif expansion_ratio >= 2.0:
-
-        score_value += 15.0
-
-    momentum = features[symbol][
-        "momentum10"
-    ]
-
-    if symbol_is_boom:
-
-        if momentum < 0:
-
-            score_value += 20.0
-            direction = "UP_SPIKE"
-
-        elif momentum > 0:
-
-            score_value += 5.0
-            direction = "UP_SPIKE"
-
-    elif symbol_is_crash:
-
-        if momentum > 0:
-
-            score_value += 20.0
-            direction = "DOWN_SPIKE"
-
-        elif momentum < 0:
-
-            score_value += 5.0
-            direction = "DOWN_SPIKE"
-
-    score_value = min(
-        100.0,
-        score_value
-    )
-
-    return {
-        "score": score_value,
-        "direction": direction,
-        "compression": compression_ratio,
-        "expansion": expansion_ratio,
-    }
-
-
-def calculate_advanced_analysis(symbol):
-
-    adx_data = calculate_adx_dmi(
-        [
-            float(item[1])
-            for item in ticks[symbol]
-        ],
-        14
-    )
-
-    if adx_data:
-
-        advanced[symbol]["adx14"] = (
-            adx_data["adx"]
-        )
-
-        advanced[symbol]["plus_di"] = (
-            adx_data["plus_di"]
-        )
-
-        advanced[symbol]["minus_di"] = (
-            adx_data["minus_di"]
-        )
-
-    else:
-
-        advanced[symbol]["adx14"] = 0.0
-        advanced[symbol]["plus_di"] = 0.0
-        advanced[symbol]["minus_di"] = 0.0
-
-    ob = calculate_order_block(
-        symbol
-    )
-
-    advanced[symbol]["ob_bullish"] = (
-        ob["bullish"]
-    )
-
-    advanced[symbol]["ob_bearish"] = (
-        ob["bearish"]
-    )
-
-    fvg = calculate_fvg(
-        symbol
-    )
-
-    advanced[symbol]["fvg_bullish"] = (
-        fvg["bullish"]
-    )
-
-    advanced[symbol]["fvg_bearish"] = (
-        fvg["bearish"]
-    )
-
-    spike = calculate_spike_analysis(
-        symbol
-    )
-
-    advanced[symbol]["spike_score"] = (
-        spike["score"]
-    )
-
-    advanced[symbol]["spike_direction"] = (
-        spike["direction"]
-    )
-
-    advanced[symbol]["compression"] = (
-        spike["compression"]
-    )
-
-    advanced[symbol]["range_expansion"] = (
-        spike["expansion"]
-    )
-
-
-def calculate_signal_score(symbol):
-
-    if not diag[symbol]["features"]:
-        return False
-
-    f = features[symbol]
-    s = structure[symbol]
-    a = advanced[symbol]
-
-    buy = 0.0
-    sell = 0.0
-
-    component_buy = {}
-    component_sell = {}
-
-    if f["trend"] == "BULLISH":
-
-        buy += 15.0
-        component_buy["trend"] = 15.0
-
-    elif f["trend"] == "BEARISH":
-
-        sell += 15.0
-        component_sell["trend"] = 15.0
-
-    else:
-
-        component_buy["trend"] = 0.0
-        component_sell["trend"] = 0.0
-
-    # ========================================================
-    # RSI CONFIRMATION FIX
-    # RSI can ONLY confirm the existing direction.
-    # RSI can NEVER create an opposite-direction score.
-    # ========================================================
-
-    momentum = f["momentum10"]
-
-    rsi = f["rsi14"]
-
-    if rsi <= 20:
-
-        if (
-            f["trend"] == "BULLISH"
-            and momentum > 0
-        ):
-
-            buy += 10.0
-            component_buy["rsi"] = 10.0
-
-    elif rsi <= 30:
-
-        if (
-            f["trend"] == "BULLISH"
-            and momentum > 0
-        ):
-
-            buy += 6.0
-            component_buy["rsi"] = 6.0
-
-    elif rsi >= 80:
-
-        if (
-            f["trend"] == "BEARISH"
-            and momentum < 0
-        ):
-
-            sell += 10.0
-            component_sell["rsi"] = 10.0
-
-    elif rsi >= 70:
-
-        if (
-            f["trend"] == "BEARISH"
-            and momentum < 0
-        ):
-
-            sell += 6.0
-            component_sell["rsi"] = 6.0
-
-    # RSI 30-70 = NO RSI SCORE
-    # RSI conflicts with trend/momentum = NO RSI SCORE
-
-    if momentum > 0:
-
-        buy += 10.0
-        component_buy["momentum"] = 10.0
-
-    elif momentum < 0:
-
-        sell += 10.0
-        component_sell["momentum"] = 10.0
-
-    structure_name = s["structure"]
-
-    if structure_name == "HH + HL":
-
-        buy += 15.0
-        component_buy["structure"] = 15.0
-
-    elif structure_name == "LH + LL":
-
-        sell += 15.0
-        component_sell["structure"] = 15.0
-
-    elif structure_name == "HH + LL":
-
-        buy += 7.5
-        sell += 7.5
-
-    elif structure_name == "LH + HL":
-
-        buy += 7.5
-        sell += 7.5
-
-    if s["bos"] == "BULLISH":
-
-        buy += 10.0
-        component_buy["bos_choch"] = 10.0
-
-    elif s["bos"] == "BEARISH":
-
-        sell += 10.0
-        component_sell["bos_choch"] = 10.0
-
-    elif s["choch"] == "BULLISH":
-
-        buy += 10.0
-        component_buy["bos_choch"] = 10.0
-
-    elif s["choch"] == "BEARISH":
-
-        sell += 10.0
-        component_sell["bos_choch"] = 10.0
-
-    price = f["price"]
-    atr = f["atr14"]
-
-    if atr > 0 and s["support"] > 0:
-
-        distance_support = (
-            price
-            - s["support"]
-        )
-
-        distance_resistance = (
-            s["resistance"]
-            - price
-        )
-
-        if (
-            0 <= distance_support
-            <= atr * 1.5
-        ):
-
-            buy += 10.0
-            component_buy["sr"] = 10.0
-
-        if (
-            0 <= distance_resistance
-            <= atr * 1.5
-        ):
-
-            sell += 10.0
-            component_sell["sr"] = 10.0
-
-    move_strength = s[
-        "move_strength"
-    ]
-
-    if move_strength >= 4.0:
-
-        if f["direction"] == "UP":
-
-            buy += 5.0
-            component_buy[
-                "move_strength"
-            ] = 5.0
-
-        elif f["direction"] == "DOWN":
-
-            sell += 5.0
-            component_sell[
-                "move_strength"
-            ] = 5.0
-
-    adx = a["adx14"]
-    plus_di = a["plus_di"]
-    minus_di = a["minus_di"]
-
-    if adx >= 20:
-
-        if plus_di > minus_di:
-
-            buy += 10.0
-            component_buy["adx"] = 10.0
-
-        elif minus_di > plus_di:
-
-            sell += 10.0
-            component_sell["adx"] = 10.0
-
-    elif adx >= 15:
-
-        if plus_di > minus_di:
-
-            buy += 5.0
-            component_buy["adx"] = 5.0
-
-        elif minus_di > plus_di:
-
-            sell += 5.0
-            component_sell["adx"] = 5.0
-
-    if a["ob_bullish"]:
-
-        buy += 5.0
-        component_buy["order_block"] = 5.0
-
-    if a["ob_bearish"]:
-
-        sell += 5.0
-        component_sell["order_block"] = 5.0
-
-    if a["fvg_bullish"]:
-
-        buy += 5.0
-        component_buy["fvg"] = 5.0
-
-    if a["fvg_bearish"]:
-
-        sell += 5.0
-        component_sell["fvg"] = 5.0
-
-    spike_score = a[
-        "spike_score"
-    ]
-
-    if spike_score >= 40:
-
-        if a["spike_direction"] == "UP_SPIKE":
-
-            buy += 5.0
-            component_buy["spike"] = 5.0
-
-        elif a["spike_direction"] == "DOWN_SPIKE":
-
-            sell += 5.0
-            component_sell["spike"] = 5.0
-
-    elif spike_score >= 20:
-
-        if a["spike_direction"] == "UP_SPIKE":
-
-            buy += 2.5
-            component_buy["spike"] = 2.5
-
-        elif a["spike_direction"] == "DOWN_SPIKE":
-
-            sell += 2.5
-            component_sell["spike"] = 2.5
-
-    buy = min(
-        100.0,
-        buy
-    )
-
-    sell = min(
-        100.0,
-        sell
-    )
-
-    difference = abs(
-        buy - sell
-    )
-
-    highest = max(
-        buy,
-        sell
-    )
-
-    if (
-        highest >= 80
-        and difference >= 20
-    ):
-
-        if buy > sell:
-            decision = "BUY WATCH"
-        else:
-            decision = "SELL WATCH"
-
-        strength = "VERY HIGH"
-
-    elif (
-        highest >= 70
-        and difference >= 15
-    ):
-
-        if buy > sell:
-            decision = "BUY WATCH"
-        else:
-            decision = "SELL WATCH"
-
-        strength = "HIGH"
-
-    elif (
-        highest >= 55
-        and difference >= 10
-    ):
-
-        if buy > sell:
-            decision = "BUY BIAS"
-        else:
-            decision = "SELL BIAS"
-
-        strength = "MEDIUM"
-
-    else:
-
-        decision = "WAIT"
-        strength = "LOW"
-
-    score[symbol] = {
-
-        "buy": buy,
-        "sell": sell,
-
-        "trend": max(
-            component_buy.get(
-                "trend",
-                0.0
-            ),
-            component_sell.get(
-                "trend",
-                0.0
-            )
-        ),
-
-        "rsi": max(
-            component_buy.get(
-                "rsi",
-                0.0
-            ),
-            component_sell.get(
-                "rsi",
-                0.0
-            )
-        ),
-
-        "momentum": max(
-            component_buy.get(
-                "momentum",
-                0.0
-            ),
-            component_sell.get(
-                "momentum",
-                0.0
-            )
-        ),
-
-        "volatility": 0.0,
-
-        "structure": max(
-            component_buy.get(
-                "structure",
-                0.0
-            ),
-            component_sell.get(
-                "structure",
-                0.0
-            )
-        ),
-
-        "bos_choch": max(
-            component_buy.get(
-                "bos_choch",
-                0.0
-            ),
-            component_sell.get(
-                "bos_choch",
-                0.0
-            )
-        ),
-
-        "sr": max(
-            component_buy.get(
-                "sr",
-                0.0
-            ),
-            component_sell.get(
-                "sr",
-                0.0
-            )
-        ),
-
-        "move_strength": max(
-            component_buy.get(
-                "move_strength",
-                0.0
-            ),
-            component_sell.get(
-                "move_strength",
-                0.0
-            )
-        ),
-
-        "adx": max(
-            component_buy.get(
-                "adx",
-                0.0
-            ),
-            component_sell.get(
-                "adx",
-                0.0
-            )
-        ),
-
-        "order_block": max(
-            component_buy.get(
-                "order_block",
-                0.0
-            ),
-            component_sell.get(
-                "order_block",
-                0.0
-            )
-        ),
-
-        "fvg": max(
-            component_buy.get(
-                "fvg",
-                0.0
-            ),
-            component_sell.get(
-                "fvg",
-                0.0
-            )
-        ),
-
-        "spike": max(
-            component_buy.get(
-                "spike",
-                0.0
-            ),
-            component_sell.get(
-                "spike",
-                0.0
-            )
-        ),
-
-        "decision": decision,
-        "strength": strength,
-    }
-
-    return True
-
-
-def calculate_features(symbol):
-
-    if len(ticks[symbol]) < 50:
-
-        diag[symbol]["features"] = 0
-
-        return False
-
-    prices = [
-        float(item[1])
-        for item in ticks[symbol]
-    ]
-
-    if len(prices) < 50:
-        return False
-
-    price = prices[-1]
-
-    ema20 = calculate_ema(
-        prices,
-        20
-    )
-
-    ema50 = calculate_ema(
-        prices,
-        50
-    )
-
-    rsi14 = calculate_rsi(
-        prices,
-        14
-    )
-
-    atr14 = calculate_atr(
-        prices,
-        14
-    )
-
-    momentum10 = calculate_momentum(
-        prices,
-        10
-    )
-
-    volatility20 = calculate_volatility(
-        prices,
-        20
-    )
-
-    if (
-        ema20 is None
-        or ema50 is None
-        or rsi14 is None
-        or atr14 is None
-        or momentum10 is None
-        or volatility20 is None
-    ):
-
-        return False
-
-    if ema20 > ema50:
-
-        trend = "BULLISH"
-
-    elif ema20 < ema50:
-
-        trend = "BEARISH"
-
-    else:
-
-        trend = "NEUTRAL"
-
-    if momentum10 > 0:
-
-        direction = "UP"
-
-    elif momentum10 < 0:
-
-        direction = "DOWN"
-
-    else:
-
-        direction = "FLAT"
-
-    features[symbol] = {
-
-        "price": price,
-        "ema20": ema20,
-        "ema50": ema50,
-        "rsi14": rsi14,
-        "atr14": atr14,
-        "momentum10": momentum10,
-        "volatility20": volatility20,
-        "trend": trend,
-        "direction": direction,
-    }
-
-    diag[symbol]["features"] = 1
-
-    calculate_market_structure(
-        symbol
-    )
-
-    calculate_advanced_analysis(
-        symbol
-    )
-
-    calculate_signal_score(
-        symbol
-    )
-
-    return True
-
-
-def process_history(
-    symbol,
-    prices,
-    times=None
-):
-
-    if not isinstance(
-        prices,
-        list
-    ):
-
-        raise RuntimeError(
-            "History prices is not a list"
-        )
-
-    if len(prices) == 0:
-
-        raise RuntimeError(
-            "History returned 0 prices"
-        )
-
-    diag[symbol]["history"] = len(
-        prices
-    )
-
-    ticks[symbol].clear()
-
-    if isinstance(
-        times,
-        list
-    ):
-
-        pairs = list(
-            zip(
-                times,
-                prices
-            )
-        )
-
-    else:
-
-        pairs = [
-            (0.0, price)
-            for price in prices
-        ]
-
-    for epoch, price in pairs:
-
-        try:
-
-            ticks[symbol].append(
-                (
-                    float(epoch),
-                    float(price)
-                )
-            )
-
-        except Exception:
-            continue
-
-    diag[symbol]["training"] = min(
-        len(prices),
-        TRAINING_COUNT
-    )
-
-    calculate_features(
-        symbol
-    )
-
-
-async def deriv_worker(symbol):
-
-    while symbol in active:
-
-        reset_diag(symbol)
-
-        try:
-
-            diag[symbol]["stage"] = (
-                "CONNECTING HISTORY"
-            )
-
-            async with websockets.connect(
-                DERIV_PUBLIC_WS,
-                ping_interval=20,
-                ping_timeout=None,
-                open_timeout=20
-            ) as ws:
-
-                diag[symbol]["connected"] = 1
-
-                diag[symbol]["stage"] = (
-                    "HISTORY"
+        tmp = MEMORY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, MEMORY_FILE)
+    except Exception as e:
+        logging.error("Memory save error: %s", e)
+
+
+def load_memory():
+    if not os.path.exists(MEMORY_FILE):
+        logging.info("No previous AI memory. Starting fresh.")
+        return
+
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        for key in INDICES:
+            if key in data.get("models", {}):
+                m = data["models"][key]
+                if (
+                    len(m.get("weights", [])) == CLASS_COUNT
+                    and all(len(row) == FEATURE_COUNT for row in m["weights"])
+                    and len(m.get("bias", [])) == CLASS_COUNT
+                ):
+                    models[key] = m
+
+            if key in data.get("stats", {}):
+                learn_stats[key].update(data["stats"][key])
+
+            if key in data.get("recent", {}):
+                recent_results[key] = deque(
+                    data["recent"][key], maxlen=RECENT_RESULTS
                 )
 
-                request = {
-                    "ticks_history": symbol,
-                    "count": HISTORY_COUNT,
-                    "end": "latest",
-                    "style": "ticks",
-                    "req_id": 2000
-                }
+        logging.info("AI memory loaded.")
+    except Exception as e:
+        logging.error("Memory load error: %s", e)
 
-                await ws.send(
-                    json.dumps(request)
-                )
 
-                while True:
+# ============================================================
+# MATH / MODEL
+# ============================================================
 
-                    raw = await asyncio.wait_for(
-                        ws.recv(),
-                        timeout=30
-                    )
+def softmax(scores):
+    m = max(scores)
+    exps = [math.exp(max(-50.0, min(50.0, x - m))) for x in scores]
+    total = sum(exps)
+    if total <= 0:
+        return [1.0 / CLASS_COUNT] * CLASS_COUNT
+    return [x / total for x in exps]
 
-                    msg = json.loads(raw)
 
-                    if "error" in msg:
+def dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
 
-                        raise RuntimeError(
-                            msg["error"].get(
-                                "message",
-                                "Deriv API error"
-                            )
-                        )
 
-                    history = msg.get(
-                        "history"
-                    )
+def predict(key, features):
+    model = models[key]
+    scores = [
+        dot(model["weights"][c], features) + model["bias"][c]
+        for c in range(CLASS_COUNT)
+    ]
+    probs = softmax(scores)
+    best = max(range(CLASS_COUNT), key=lambda i: probs[i])
+    return best, probs[best], probs
 
-                    if isinstance(
-                        history,
-                        dict
-                    ):
 
-                        prices = history.get(
-                            "prices",
-                            []
-                        )
+def train_model(key, features, actual_class):
+    model = models[key]
 
-                        times = history.get(
-                            "times",
-                            []
-                        )
+    scores = [
+        dot(model["weights"][c], features) + model["bias"][c]
+        for c in range(CLASS_COUNT)
+    ]
+    probs = softmax(scores)
 
-                        process_history(
-                            symbol,
-                            prices,
-                            times
-                        )
+    for c in range(CLASS_COUNT):
+        target = 1.0 if c == actual_class else 0.0
+        error = target - probs[c]
 
-                        break
+        for i in range(FEATURE_COUNT):
+            gradient = error * features[i] - L2 * model["weights"][c][i]
+            model["weights"][c][i] += LEARNING_RATE * gradient
 
-            diag[symbol]["stage"] = (
-                "CONNECTING LIVE"
-            )
+        model["bias"][c] += LEARNING_RATE * error
 
-            async with websockets.connect(
-                DERIV_PUBLIC_WS,
-                ping_interval=20,
-                ping_timeout=None,
-                open_timeout=20
-            ) as ws:
+    model["samples"] += 1
+    learn_stats[key]["training"] += 1
 
-                diag[symbol]["connected"] = 1
-                diag[symbol]["stage"] = "LIVE"
 
-                request = {
-                    "ticks": symbol,
-                    "subscribe": 1,
-                    "req_id": 3000
-                }
+# ============================================================
+# FEATURE ENGINE
+# ============================================================
 
-                await ws.send(
-                    json.dumps(request)
-                )
+def calculate_features(prices):
+    if len(prices) < 210:
+        return None
+    p=[float(x) for x in prices]
+    cur=p[-1]
+    if cur==0: return None
+    def ret(n):
+        old=p[-1-n]
+        return ((cur-old)/old*100.0) if old else 0.0
+    r1,r3,r5,r10,r20,r50,r100,r200=[ret(n) for n in (1,3,5,10,20,50,100,200)]
+    momentum=r5*.30+r10*.25+r20*.20+r50*.15+r100*.10
+    acceleration=r5-r20
+    recent=p[-50:]
+    ch=[abs((recent[i]-recent[i-1])/recent[i-1]*100) for i in range(1,len(recent)) if recent[i-1]!=0]
+    volatility=sum(ch)/len(ch) if ch else 0.0
+    up=down=0
+    for i in range(1,min(30,len(p)-1)):
+        if p[-i]>p[-i-1]: up+=1
+        elif p[-i]<p[-i-1]: down+=1
+    pressure=(up-down)/30.0
+    gains=[]; losses=[]
+    for i in range(max(1,len(p)-15),len(p)):
+        d=p[i]-p[i-1]; gains.append(max(d,0)); losses.append(max(-d,0))
+    ag=sum(gains)/len(gains) if gains else 0; al=sum(losses)/len(losses) if losses else 0
+    rsi=100 if ag>0 and al==0 else (50 if al==0 else 100-(100/(1+ag/al)))
+    rsi_norm=(rsi-50)/50
+    def mean(n): return sum(p[-n:])/min(n,len(p))
+    ema12,ema26=mean(12),mean(26); macd=(ema12-ema26)/cur*100
+    signal=mean(9); macd_signal=(ema12-signal)/cur*100
+    tr=[abs(p[i]-p[i-1]) for i in range(max(1,len(p)-30),len(p))]
+    atr=sum(tr)/len(tr) if tr else 0; atr_pct=atr/cur*100 if cur else 0; atr_move=(p[-1]-p[-2])/atr if atr else 0
+    w=p[-20:]; m=sum(w)/len(w); sd=(sum((x-m)**2 for x in w)/len(w))**.5
+    bb=(cur-m)/(2*sd) if sd else 0
+    sma20,sma50,sma100=mean(20),mean(50),mean(100)
+    trend=((sma20-sma50)/sma50*100 if sma50 else 0)*.5+((sma50-sma100)/sma100*100 if sma100 else 0)*.3+((cur-sma20)/sma20*100 if sma20 else 0)*.2
+    plus=minus=0
+    for i in range(max(1,len(p)-20),len(p)):
+        d=p[i]-p[i-1]
+        if d>0: plus+=d
+        elif d<0: minus-=d
+    dmi=(plus-minus)/(plus+minus) if plus+minus else 0; adx=abs(dmi)
+    a=p[-20:]; b=p[-40:-20]
+    rh,rl=max(a),min(a); ph,pl=max(b),min(b)
+    structure=1 if rh>ph and rl>pl else (-1 if rh<ph and rl<pl else 0)
+    bos=1 if cur>ph else (-1 if cur<pl else 0)
+    prev_struct=1 if p[-20]>p[-40] else (-1 if p[-20]<p[-40] else 0)
+    curr_struct=1 if cur>p[-20] else (-1 if cur<p[-20] else 0)
+    choch=curr_struct if curr_struct!=prev_struct else 0
+    look=p[-31:-1]; hi=max(look); lo=min(look)
+    liquidity=1 if cur>hi else (-1 if cur<lo else 0)
+    fvg=1 if p[-5]<p[-3]<p[-1] else (-1 if p[-5]>p[-3]>p[-1] else 0)
+    dif=[p[i]-p[i-1] for i in range(max(1,len(p)-15),len(p))]
+    mx=max((abs(x) for x in dif),default=0); ob=(max(dif,key=abs)/mx if mx else 0)
+    old=[abs(p[i]-p[i-1]) for i in range(max(1,len(p)-60),max(1,len(p)-30))]
+    new=[abs(p[i]-p[i-1]) for i in range(max(1,len(p)-30),len(p))]
+    oa=sum(old)/len(old) if old else 0; na=sum(new)/len(new) if new else 0
+    amd=0
+    if oa:
+        exp=na/oa
+        if exp>1.3: amd=1 if momentum>0 else -1
+        elif exp<.75: amd=.5 if momentum>0 else -.5
+    large=0; since=300
+    for i in range(max(1,len(p)-300),len(p)):
+        if abs((p[i]-p[i-1])/p[i-1]*100) >= SPIKE_THRESHOLD: large+=1; since=0
+        else: since=min(since+1,300)
+    spike_distance=since/300; spike_frequency=min(large/10,1)
+    range10=max(p[-10:])-min(p[-10:]); range50=max(p[-50:])-min(p[-50:])
+    compression=1-min(range10/range50,1) if range50 else 0
+    tick_accel=r1-r3
+    directional_pressure=pressure*.6+dmi*.4
+    f=[r1,r3,r5,r10,r20,r50,r100,r200,momentum,acceleration,volatility,pressure,rsi_norm,macd,macd_signal,atr_pct,atr_move,bb,trend,adx,dmi,structure,bos,choch,liquidity,fvg,ob,amd,spike_distance,spike_frequency,compression,tick_accel,directional_pressure]
+    return [max(-5,min(5,float(x))) for x in f] if len(f)==FEATURE_COUNT else None
 
-                while symbol in active:
 
-                    raw = await asyncio.wait_for(
-                        ws.recv(),
-                        timeout=60
-                    )
+def historical_label(prices,timestamps,i):
+    if i<210 or i>=len(prices)-1 or prices[i]==0: return None
+    t0=timestamps[i]; start=prices[i]; j=i+1
+    while j<len(prices):
+        dt=timestamps[j]-t0
+        if dt<EARLY_MIN_SECONDS: j+=1; continue
+        if dt>EARLY_MAX_SECONDS: break
+        move=(prices[j]-start)/start*100
+        if abs(move)>=SPIKE_THRESHOLD: return 1 if move>0 else 2
+        j+=1
+    return 0 if j<len(prices) or timestamps[-1]-t0>=EARLY_MAX_SECONDS else None
 
-                    msg = json.loads(raw)
 
-                    if "error" in msg:
-
-                        raise RuntimeError(
-                            msg["error"].get(
-                                "message",
-                                "Deriv API error"
-                            )
-                        )
-
-                    tick = msg.get(
-                        "tick"
-                    )
-
-                    if not isinstance(
-                        tick,
-                        dict
-                    ):
-                        continue
-
-                    quote = tick.get(
-                        "quote"
-                    )
-
-                    epoch = tick.get(
-                        "epoch",
-                        0
-                    )
-
-                    if quote is None:
-                        continue
-
-                    price = float(
-                        quote
-                    )
-
-                    ticks[symbol].append(
-                        (
-                            float(epoch),
-                            price
-                        )
-                    )
-
-                    diag[symbol]["subscribed"] = 1
-
-                    diag[symbol]["ticks"] += 1
-
-                    calculate_features(
-                        symbol
-                    )
-
-                    diag[symbol]["stage"] = "LIVE"
-
-        except asyncio.CancelledError:
-
-            return
-
+def warmup_model(key):
+    if key in history_trained: return
+    data=history_data[key]
+    if len(data)<500: return
+    ts=[x[0] for x in data]; prices=[x[1] for x in data]
+    target=max(0,MIN_TRAINING_SAMPLES-models[key]["samples"])
+    if target<=0: history_trained.add(key); return
+    start=210; end=len(prices)-1; step=max(1,(end-start)//max(1,min(target,1200)))
+    trained=0; i=start
+    while i<end and trained<target:
+        try: f=calculate_features(prices[:i+1])
         except Exception as e:
+            diagnostics[key]["errors"]+=1; diagnostics[key]["last_error"]=str(e); f=None
+        if f is not None:
+            label=historical_label(prices,ts,i)
+            if label is not None: train_model(key,f,label); trained+=1
+        i+=step
+    history_trained.add(key); save_memory()
+    logging.info("%s V4 warm-up +%d samples, total=%d",key,trained,models[key]["samples"])
 
-            diag[symbol]["stage"] = (
-                "ERROR"
-            )
+# ============================================================
+# HISTORICAL WARM-UP
+# ============================================================
+# LIVE RESULT EVALUATION
+# ============================================================
 
-            diag[symbol]["connected"] = 0
+def evaluate_prediction_window(pred,data,now):
+    t0=pred["time"]; start=pred["price"]
+    found=None
+    for ts,price in data:
+        dt=ts-t0
+        if dt<EARLY_MIN_SECONDS: continue
+        if dt>EARLY_MAX_SECONDS: break
+        if start:
+            move=(price-start)/start*100
+            if abs(move)>=SPIKE_THRESHOLD:
+                found=1 if move>0 else 2; break
+    if found is None:
+        return None if now-t0<EARLY_MAX_SECONDS else 0
+    wanted=1 if pred["direction"]=="BUY" else 2
+    return 1 if found==wanted else -1
 
-            diag[symbol]["subscribed"] = 0
 
-            diag[symbol]["error"] = (
-                f"{type(e).__name__}: "
-                f"{str(e)[:200]}"
-            )
+async def evaluate_predictions(key,current_time,current_price=None):
+    pending=pending_predictions[key]
+    if not pending: return
+    data=list(ticks_data[key]); remaining=[]; changed=False
+    for pred in pending:
+        result=evaluate_prediction_window(pred,data,current_time)
+        if result is None:
+            remaining.append(pred); continue
+        changed=True
+        if result==1:
+            learn_stats[key]["ok"]+=1; recent_results[key].append(1)
+            actual=1 if pred["direction"]=="BUY" else 2; text="WIN"
+        elif result==-1:
+            learn_stats[key]["fail"]+=1; recent_results[key].append(0)
+            actual=2 if pred["direction"]=="BUY" else 1; text="LOSS"
+        else:
+            learn_stats[key]["fail"]+=1; learn_stats[key]["no_spike"]+=1; recent_results[key].append(0)
+            actual=0; text="NO SPIKE"
+        train_model(key,pred["features"],actual)
+        logging.info("%s result=%s direction=%s confidence=%.3f",key,text,pred["direction"],pred.get("confidence",0))
+    pending_predictions[key]=remaining
+    if changed: save_memory()
 
-            logging.error(
-                "[%s] %s",
-                symbol,
-                diag[symbol]["error"]
-            )
 
-            if symbol in active:
+# ============================================================
+# CONFIDENCE / FILTERS
+# ============================================================
 
+def recent_winrate(key):
+    data=list(recent_results[key])
+    return None if len(data)<MIN_RECENT_RESULTS else sum(data)/len(data)
+
+
+def adaptive_confidence(key):
+    # V5 diagnostic mode: 40% threshold.
+    return 0.40
+
+
+def signal_allowed(key,predicted_class,confidence,features):
+    # Diagnostic mode: disable V4 direction and recent-win-rate gates.
+    # This isolates whether the confidence threshold was too strict.
+    if models[key]["samples"] < MIN_TRAINING_SAMPLES:
+        diagnostics[key]["blocked_training"] += 1
+        return False
+    if predicted_class == 0:
+        return False
+    if confidence < adaptive_confidence(key):
+        diagnostics[key]["blocked_confidence"] += 1
+        return False
+    if time.time() - last_signal_time[key] < COOLDOWN_SECONDS:
+        diagnostics[key]["blocked_cooldown"] += 1
+        return False
+    return True
+
+
+# ============================================================
+# TELEGRAM SIGNAL
+# ============================================================
+
+async def send_signal(app, key, direction, confidence, probabilities):
+    info = INDICES[key]
+    wr = recent_winrate(key)
+    wr_text = "not enough data" if wr is None else f"{wr * 100:.1f}%"
+
+    if direction == "BUY":
+        action = "BUY NOW 🟢"
+        move = "UP SPIKE 📈"
+    else:
+        action = "SELL NOW 🔴"
+        move = "DOWN SPIKE 📉"
+
+    text = (
+        "🧠🔥 AI MANIAC V5\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📊 {info['name']}\n"
+        f"⚡ {action}\n"
+        f"🎯 {move}\n"
+        "⏱️ Expected: 60–120 sec after signal\n"
+        f"🧠 Model confidence: {confidence * 100:.1f}%\n"
+        f"📚 Training samples: {models[key]['samples']}\n"
+        f"📈 Recent win rate: {wr_text}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"UP: {probabilities[1] * 100:.1f}%\n"
+        f"DOWN: {probabilities[2] * 100:.1f}%\n"
+        f"NO SPIKE: {probabilities[0] * 100:.1f}%\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ Prediction only — guaranteed profit биш."
+    )
+
+    for cid in list(chat_ids):
+        try:
+            await app.bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logging.error("Telegram send error: %s", e)
+
+
+# ============================================================
+# DERIV WEBSOCKET
+# ============================================================
+
+async def deriv_ws(symbol, key, app):
+    uri = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+
+    async with websockets.connect(
+        uri,
+        ping_interval=20,
+        ping_timeout=None,
+        close_timeout=10,
+    ) as ws:
+
+        # 5000 ticks for historical warm-up.
+        await ws.send(json.dumps({
+            "ticks_history": symbol,
+            "count": WARMUP_HISTORY,
+            "end": "latest",
+            "style": "ticks",
+        }))
+
+        # Subscribe to live ticks.
+        await ws.send(json.dumps({
+            "ticks": symbol,
+            "subscribe": 1,
+        }))
+
+        logging.info("%s CONNECTED", key)
+
+        while key in active:
+            raw = await ws.recv()
+            msg = json.loads(raw)
+
+            # ---------------- HISTORY ----------------
+            if "history" in msg:
+                prices = msg["history"].get("prices", [])
+                times = msg["history"].get("times", [])
+
+                history_data[key] = []
+
+                for i, price in enumerate(prices):
+                    try:
+                        ts = float(times[i]) if i < len(times) else 0.0
+                        history_data[key].append((ts, float(price)))
+                    except Exception:
+                        pass
+
+                if history_data[key]:
+                    # Seed live buffer with the latest 500.
+                    for item in history_data[key][-LIVE_HISTORY:]:
+                        ticks_data[key].append(item)
+
+                # Warm-up is CPU work; run it in a thread so Telegram
+                # remains responsive.
+                await asyncio.to_thread(warmup_model, key)
+
+                logging.info(
+                    "%s history loaded: %d ticks",
+                    key, len(history_data[key])
+                )
+
+            # ---------------- LIVE TICK ----------------
+            if "tick" in msg:
+                tick = msg["tick"]
+
+                try:
+                    price = float(tick["quote"])
+                    timestamp = float(tick.get("epoch", time.time()))
+                except Exception:
+                    continue
+
+                ticks_data[key].append((timestamp, price))
+
+                prices = [x[1] for x in ticks_data[key]]
+
+                if len(prices) < 210:
+                    continue
+
+                await evaluate_predictions(
+                    key,
+                    timestamp,
+                    price,
+                )
+
+                try:
+                    features = calculate_features(prices)
+                except Exception as e:
+                    diagnostics[key]["errors"] += 1
+                    diagnostics[key]["last_error"] = str(e)
+                    logging.error("%s feature error: %s", key, e)
+                    continue
+
+                if features is None:
+                    continue
+
+                diagnostics[key]["features"] += 1
+
+                predicted_class, confidence, probabilities = predict(
+                    key,
+                    features
+                )
+                diagnostics[key]["last_confidence"] = confidence
+                if predicted_class != 0:
+                    diagnostics[key]["candidates"] += 1
+
+                if not signal_allowed(
+                    key,
+                    predicted_class,
+                    confidence,
+                    features,
+                ):
+                    continue
+
+                direction = "BUY" if predicted_class == 1 else "SELL"
+
+                # Save the prediction so the model can learn from
+                # the actual result after 60 seconds.
+                pending_predictions[key].append({
+                    "time": timestamp,
+                    "price": price,
+                    "direction": direction,
+                    "features": features,
+                    "confidence": confidence,
+                })
+
+                last_signal_time[key] = time.time()
+                diagnostics[key]["signals"] += 1
+
+                await send_signal(
+                    app,
+                    key,
+                    direction,
+                    confidence,
+                    probabilities,
+                )
+
+
+async def start_ws(symbol, key, app):
+    while key in active:
+        try:
+            await deriv_ws(symbol, key, app)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logging.error("%s websocket error: %s", key, e)
+            if key in active:
                 await asyncio.sleep(5)
 
 
-def start_index(symbol):
+# ============================================================
+# KEEP ALIVE
+# ============================================================
 
-    active.add(symbol)
+def keep_alive():
+    port = int(os.environ.get("PORT", "10000"))
 
-    if (
-        symbol not in tasks
-        or tasks[symbol].done()
-    ):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"AI MANIAC V3 LIVE")
 
-        tasks[symbol] = (
-            asyncio.create_task(
-                deriv_worker(symbol)
+        def log_message(self, *args):
+            return
+
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+
+threading.Thread(target=keep_alive, daemon=True).start()
+
+
+# ============================================================
+# TELEGRAM UI
+# ============================================================
+
+def index_buttons():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"{'✅' if k in active else '❌'} {v['name']}",
+                callback_data=k,
             )
-        )
+        ]
+        for k, v in INDICES.items()
+    ])
 
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_ids.add(update.effective_chat.id)
 
-    for symbol in INDICES:
+    # /start automatically activates all 7.
+    for key in INDICES:
+        active.add(key)
 
-        start_index(symbol)
+        if key not in ws_tasks or ws_tasks[key].done():
+            ws_tasks[key] = asyncio.create_task(
+                start_ws(
+                    INDICES[key]["symbol"],
+                    key,
+                    context.application,
+                )
+            )
 
     await update.message.reply_text(
-
-        "👹🧠 AI МАНГАС V5 FIX\n\n"
-
-        "7 INDEX LIVE + FEATURE ENGINE ✅\n"
-
-        "MARKET STRUCTURE ON ✅\n"
-
-        "BOS / CHoCH LOGIC FIX ON ✅\n"
-
-        "MOVE STRENGTH NORMALIZED FIX ON ✅\n"
-
-        "ADX / DMI ANALYSIS ON ✅\n"
-
-        "ORDER BLOCK ANALYSIS ON ✅\n"
-
-        "FVG / IMBALANCE ANALYSIS ON ✅\n"
-
-        "SPIKE ANALYSIS ON ✅\n"
-
-        "SIGNAL SCORE ENGINE V1 ON ✅\n\n"
-
-        "⚠️ SCORE ONLY MODE\n"
-
-        "Telegram BUY/SELL SIGNAL: OFF ❌\n\n"
-
-        "History → Live Tick → "
-        "Features → Structure → "
-        "Advanced Analysis → Score\n\n"
-
-        "/status"
+        "🧠🔥 AI MANIAC V5\n\n"
+        "ЗӨВХӨН 7 BOOM / CRASH INDEX\n\n"
+        "✅ 7 индекс бүгд идэвхжлээ.\n"
+        "📡 Live tick data авч байна.\n"
+        "🧠 AI historical data-аар warm-up хийнэ.\n"
+        "🔄 Шинэ prediction бүрийн дараа өөрийгөө шинэчилнэ.\n"
+        "💾 Сурсан жинг memory-д хадгална.\n"
+        "🎯 Зөвхөн 85%+ model confidence үед Telegram signal.\n\n"
+        "⚠️ Эхлээд суралцана. Шууд ашиг амлахгүй.",
+        reply_markup=index_buttons(),
     )
 
 
-async def status(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
 
-    lines = [
+    key = q.data
+    chat_ids.add(q.message.chat.id)
 
-        "👹🧠 AI МАНГАС V5 FIX",
-        "",
-        "🧠 FEATURE + MARKET STRUCTURE + SCORE",
-        "==============================",
-        ""
-    ]
+    if key in active:
+        active.remove(key)
 
-    for symbol, name in INDICES.items():
+        task = ws_tasks.get(key)
+        if task and not task.done():
+            task.cancel()
 
-        d = diag[symbol]
-        f = features[symbol]
-        s = structure[symbol]
-        a = advanced[symbol]
-        sc = score[symbol]
+        await q.message.reply_text(
+            f"❌ {INDICES[key]['name']} унтарлаа."
+        )
+    else:
+        active.add(key)
 
-        ws_status = (
-            "ON ✅"
-            if d["connected"]
-            else
-            "OFF ❌"
+        if key not in ws_tasks or ws_tasks[key].done():
+            ws_tasks[key] = asyncio.create_task(
+                start_ws(
+                    INDICES[key]["symbol"],
+                    key,
+                    context.application,
+                )
+            )
+
+        await q.message.reply_text(
+            f"✅ {INDICES[key]['name']} идэвхжлээ!\n"
+            f"🧠 Training: {models[key]['samples']}\n"
+            f"🎯 Signal threshold: {adaptive_confidence(key) * 100:.0f}%"
         )
 
-        sub_status = (
-            "YES ✅"
-            if d["subscribed"]
-            else
-            "NO ❌"
+    try:
+        await q.edit_message_reply_markup(
+            reply_markup=index_buttons()
+        )
+    except Exception:
+        pass
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_ids.add(update.effective_chat.id)
+    now = time.time()
+
+    msg = "🧠🔥 AI MANIAC V5 STATUS\n━━━━━━━━━━━━━━━━━━\n\n"
+
+    for key, info in INDICES.items():
+        m = models[key]
+        ok = learn_stats[key]["ok"]
+        fail = learn_stats[key]["fail"]
+        total = ok + fail
+
+        wr = (ok / total * 100.0) if total else 0.0
+
+        msg += (
+            f"{'🟢' if key in active else '⚪'} {info['name']}\n"
+            f"Ticks: {len(ticks_data[key])}/{LIVE_HISTORY}\n"
+            f"AI Training: {m['samples']}\n"
+            f"WIN: {ok} | LOSS: {fail}\n"
+            f"WinRate: {wr:.1f}%\n"
+            f"Pending: {len(pending_predictions[key])} | Candidates: {diagnostics[key]['candidates']}\n"
+            f"Signals: {diagnostics[key]['signals']} | Errors: {diagnostics[key]['errors']}\n\n"
         )
 
-        feature_status = (
-            "READY ✅"
-            if d["features"]
-            else
-            "WAITING ⏳"
-        )
-
-        lines.extend([
-
-            f"{name}",
-            f"API Symbol: {symbol}",
-            f"Stage: {d['stage']}",
-            f"WS: {ws_status}",
-            f"Sub: {sub_status}",
-            f"Live ticks: {d['ticks']}",
-            f"History: {d['history']}",
-            f"Training: {d['training']}",
-            f"Features: {feature_status}",
-        ])
-
-        if d["features"]:
-
-            lines.extend([
-
-                f"Price: {f['price']:.5f}",
-                f"EMA20: {f['ema20']:.5f}",
-                f"EMA50: {f['ema50']:.5f}",
-                f"RSI14: {f['rsi14']:.2f}",
-                f"ATR14: {f['atr14']:.5f}",
-
-                f"Momentum10: "
-                f"{f['momentum10']:.4f}%",
-
-                f"Volatility20: "
-                f"{f['volatility20']:.5f}%",
-
-                f"Trend: {f['trend']}",
-
-                f"Direction: "
-                f"{f['direction']}",
-            ])
-
-        if s["swing_high"] > 0:
-
-            lines.extend([
-
-                "",
-                "📊 MARKET STRUCTURE",
-
-                f"Swing High: "
-                f"{s['swing_high']:.5f}",
-
-                f"Prev High: "
-                f"{s['previous_swing_high']:.5f}",
-
-                f"Swing Low: "
-                f"{s['swing_low']:.5f}",
-
-                f"Prev Low: "
-                f"{s['previous_swing_low']:.5f}",
-
-                f"Structure: "
-                f"{s['structure']}",
-
-                f"BOS: {s['bos']}",
-                f"CHoCH: {s['choch']}",
-
-                f"Support: "
-                f"{s['support']:.5f}",
-
-                f"Resistance: "
-                f"{s['resistance']:.5f}",
-
-                f"Move Strength: "
-                f"{s['move_strength']:.2f} ATR",
-
-                f"Swing High Count: "
-                f"{s['swing_high_count']}",
-
-                f"Swing Low Count: "
-                f"{s['swing_low_count']}",
-            ])
-
-        else:
-
-            lines.extend([
-
-                "",
-                "📊 MARKET STRUCTURE",
-
-                "Structure: WAITING ⏳",
-
-                (
-                    f"Swing High Count: "
-                    f"{s['swing_high_count']}/2"
-                ),
-
-                (
-                    f"Swing Low Count: "
-                    f"{s['swing_low_count']}/2"
-                ),
-
-                (
-                    f"Reason: "
-                    f"{s['structure_error'] or 'UNKNOWN'}"
-                ),
-            ])
-
-        if d["features"]:
-
-            lines.extend([
-
-                "",
-                "🧠 ADVANCED ANALYSIS",
-
-                f"ADX14: "
-                f"{a['adx14']:.2f}",
-
-                f"+DI: "
-                f"{a['plus_di']:.2f}",
-
-                f"-DI: "
-                f"{a['minus_di']:.2f}",
-
-                (
-                    "Order Block: "
-                    f"BULLISH={'YES' if a['ob_bullish'] else 'NO'} "
-                    f"BEARISH={'YES' if a['ob_bearish'] else 'NO'}"
-                ),
-
-                (
-                    "FVG/Imbalance: "
-                    f"BULLISH={'YES' if a['fvg_bullish'] else 'NO'} "
-                    f"BEARISH={'YES' if a['fvg_bearish'] else 'NO'}"
-                ),
-
-                f"Spike Setup: "
-                f"{a['spike_score']:.0f}/100",
-
-                f"Spike Direction: "
-                f"{a['spike_direction']}",
-
-                f"Compression: "
-                f"{a['compression']:.2f}",
-
-                f"Range Expansion: "
-                f"{a['range_expansion']:.2f} ATR",
-            ])
-
-            lines.extend([
-
-                "",
-                "🎯 SIGNAL SCORE V1",
-
-                f"BUY SCORE: "
-                f"{sc['buy']:.0f}/100",
-
-                f"SELL SCORE: "
-                f"{sc['sell']:.0f}/100",
-
-                f"Decision: "
-                f"{sc['decision']}",
-
-                f"Strength: "
-                f"{sc['strength']}",
-
-                "",
-                "Score Components:",
-
-                f"Trend: "
-                f"{sc['trend']:.0f}",
-
-                f"RSI: "
-                f"{sc['rsi']:.0f}",
-
-                f"Momentum: "
-                f"{sc['momentum']:.0f}",
-
-                f"Structure: "
-                f"{sc['structure']:.0f}",
-
-                f"BOS/CHoCH: "
-                f"{sc['bos_choch']:.0f}",
-
-                f"S/R: "
-                f"{sc['sr']:.0f}",
-
-                f"Move Strength: "
-                f"{sc['move_strength']:.0f}",
-
-                f"ADX/DMI: "
-                f"{sc['adx']:.0f}",
-
-                f"Order Block: "
-                f"{sc['order_block']:.0f}",
-
-                f"FVG: "
-                f"{sc['fvg']:.0f}",
-
-                f"Spike: "
-                f"{sc['spike']:.0f}",
-
-                "Telegram Signal: OFF ❌",
-            ])
-
-        lines.extend([
-
-            f"Err: "
-            f"{d['error'] or 'NONE'}",
-
-            "--------------------",
-        ])
-
-    text = "\n".join(lines)
-
-    while len(text) > 3800:
-
-        cut = text.rfind(
-            "\n",
-            0,
-            3800
-        )
-
-        if cut <= 0:
-            cut = 3800
-
-        await update.message.reply_text(
-            text[:cut]
-        )
-
-        text = text[cut:]
-
-    if text:
-
-        await update.message.reply_text(
-            text
-        )
-
-
-async def symbols(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    text = (
-        "👹🧠 AI МАНГАС V5 FIX\n\n"
-        "ЗӨВХӨН 7 INDEX\n\n"
+    msg += (
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 Active: {len(active)}/7\n"
+        "🧠 Online learning: ON\n"
+        "💾 Persistent memory: ON\n"
+        "🎯 Adaptive confidence: 75–80%\n"
+        "⚠️ WinRate нь бодит үр дүнгээр тооцогдоно."
     )
 
-    for i, (
-        symbol,
-        name
-    ) in enumerate(
-        INDICES.items(),
-        start=1
-    ):
+    await update.message.reply_text(msg)
 
-        text += (
-            f"{i}. {symbol}\n"
-            f"   {name}\n\n"
+
+# ============================================================
+# AI STATUS
+# ============================================================
+
+async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_ids.add(update.effective_chat.id)
+
+    msg = "🧠🔥 AI BRAIN\n━━━━━━━━━━━━━━━━━━\n"
+
+    for key, info in INDICES.items():
+        msg += (
+            f"\n{info['name']}\n"
+            f"Learned: {models[key]['samples']}\n"
+            f"Live WIN: {learn_stats[key]['ok']}\n"
+            f"Live LOSS: {learn_stats[key]['fail']}\n"
         )
+
+    msg += (
+        "\n━━━━━━━━━━━━━━━━━━\n"
+        "7 индекс тус бүр өөрийн model-той."
+    )
+
+    await update.message.reply_text(msg)
+
+
+# ============================================================
+# TEST
+# ============================================================
+
+async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_ids.add(update.effective_chat.id)
 
     await update.message.reply_text(
-        text
+        "🧪 AI MANIAC V5 TEST\n\n"
+        "Telegram: OK ✅\n"
+        "7 Index engine: OK ✅\n"
+        "Historical warm-up: ON ✅\n"
+        "Online learning: ON ✅\n"
+        "Persistent memory: ON ✅\n"
+        "Adaptive 75–80% signal filter: ON ✅\n"
+        "Auto /start activation: ON ✅\n\n"
+        "⚠️ TEST MESSAGE ONLY"
     )
 
 
-async def rawstatus(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+# ============================================================
+# MAIN
+# ============================================================
 
-    await update.message.reply_text(
+load_memory()
 
-        "👹🧠 AI МАНГАС V5 FIX\n\n"
+app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-        "DERIV NEW PUBLIC API\n\n"
-
-        f"Endpoint:\n"
-        f"{DERIV_PUBLIC_WS}\n\n"
-
-        f"Active workers: "
-        f"{len(active)}/7\n\n"
-
-        "FEATURE + MARKET STRUCTURE + "
-        "ADVANCED ANALYSIS + SCORE MODE\n\n"
-
-        "BOS / CHoCH LOGIC FIX ON\n"
-
-        "MOVE STRENGTH NORMALIZED FIX ON\n"
-
-        "ADX / DMI ON\n"
-
-        "ORDER BLOCK ON\n"
-
-        "FVG / IMBALANCE ON\n"
-
-        "SPIKE ANALYSIS ON\n"
-
-        "SIGNAL SCORE V1 ON\n"
-
-        "TELEGRAM SIGNAL: OFF"
-    )
-
-
-async def startup(app):
-
-    for symbol in INDICES:
-
-        start_index(symbol)
-
-
-app = (
-    ApplicationBuilder()
-    .token(TOKEN)
-    .post_init(startup)
-    .build()
-)
-
-app.add_handler(
-    CommandHandler(
-        "start",
-        start
-    )
-)
-
-app.add_handler(
-    CommandHandler(
-        "status",
-        status
-    )
-)
-
-app.add_handler(
-    CommandHandler(
-        "symbols",
-        symbols
-    )
-)
-
-app.add_handler(
-    CommandHandler(
-        "rawstatus",
-        rawstatus
-    )
-)
-
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("status", status_cmd))
+app.add_handler(CommandHandler("ai", ai_cmd))
+app.add_handler(CommandHandler("test", test_cmd))
+app.add_handler(CallbackQueryHandler(button))
 
 if __name__ == "__main__":
-
+    logging.info("🔥 AI MANIAC V5 STARTING")
+    logging.info("ONLY 7 BOOM/CRASH INDICES")
     app.run_polling()
