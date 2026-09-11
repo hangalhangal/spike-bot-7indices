@@ -318,6 +318,7 @@ def warmup_model(key):
     # First collect a larger labeled pool, then apply inverse-frequency
     # class weighting during the actual 300-sample warm-up.
     pool=[]; class_counts=[0]*CLASS_COUNT
+    trained=0
     pool_step=max(1,(end-start)//max(1,min(target*4,4000)))
     i=start
     while i<end and len(pool)<max(target*4,1200):
