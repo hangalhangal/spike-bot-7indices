@@ -190,7 +190,7 @@ def predict(key, features):
     return best, probs[best], probs
 
 
-def train_model(key, features, actual_class):
+def train_model(key, features, actual_class, class_weight=1.0):
     model = models[key]
 
     scores = [
@@ -201,7 +201,7 @@ def train_model(key, features, actual_class):
 
     for c in range(CLASS_COUNT):
         target = 1.0 if c == actual_class else 0.0
-        error = target - probs[c]
+        error = (target - probs[c]) * class_weight
 
         for i in range(FEATURE_COUNT):
             gradient = error * features[i] - L2 * model["weights"][c][i]
@@ -312,15 +312,35 @@ def warmup_model(key):
     target=max(0,MIN_TRAINING_SAMPLES-models[key]["samples"])
     if target<=0: history_trained.add(key); return
     start=210; end=len(prices)-1; step=max(1,(end-start)//max(1,min(target,1200)))
-    trained=0; i=start
-    while i<end and trained<target:
+    # The spike class is rare, so the old chronological warm-up taught the
+    # model mostly class 0 (NO SPIKE). That can make every live prediction
+    # collapse to class 0 and leave Candidates at zero.
+    # First collect a larger labeled pool, then apply inverse-frequency
+    # class weighting during the actual 300-sample warm-up.
+    pool=[]; class_counts=[0]*CLASS_COUNT
+    pool_step=max(1,(end-start)//max(1,min(target*4,4000)))
+    i=start
+    while i<end and len(pool)<max(target*4,1200):
         try: f=calculate_features(prices[:i+1])
         except Exception as e:
             diagnostics[key]["errors"]+=1; diagnostics[key]["last_error"]=str(e); f=None
         if f is not None:
             label=historical_label(prices,ts,i)
-            if label is not None: train_model(key,f,label); trained+=1
-        i+=step
+            if label is not None:
+                pool.append((f,label)); class_counts[label]+=1
+        i+=pool_step
+
+    if pool:
+        total=sum(class_counts)
+        weights=[(total/(CLASS_COUNT*c) if c else 1.0) for c in class_counts]
+        mean_w=sum(weights[c] * class_counts[c] for c in range(CLASS_COUNT))/max(total,1)
+        weights=[w/max(mean_w,1e-9) for w in weights]
+
+        # Keep the original chronological order; only rebalance the learning
+        # contribution so the rare spike classes are not drowned by class 0.
+        for f,label in pool[:target]:
+            train_model(key,f,label,weights[label]); trained+=1
+            if trained>=target: break
     history_trained.add(key); save_memory()
     logging.info("%s V4 warm-up +%d samples, total=%d",key,trained,models[key]["samples"])
 
