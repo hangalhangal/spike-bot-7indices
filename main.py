@@ -1543,16 +1543,12 @@ def build_predictive_model(symbol):
     start_index = 50
 
     end_index = (
-        len(prices)
-        - 20
+        len(prices) - 20
     )
 
     if end_index <= start_index:
         return
 
-    # Use historical points spaced apart.
-    # Their future outcome is known only for these
-    # historical points, never for the current tick.
     step = 8
 
     for i in range(
@@ -1632,68 +1628,142 @@ def build_predictive_model(symbol):
             - future_low
         )
 
-        if (
-            symbol.startswith("BOOM")
-            and upward_move
-            >= atr * PREDICTION_SPIKE_ATR
+        # ====================================================
+        # IMPORTANT:
+        # BEFORE the 90-second prediction window,
+        # reject examples where the spike already started.
+        # This prevents the model from learning "spike is
+        # already happening" as a predictive pattern.
+        # ====================================================
+
+        pre_window_indexes = []
+
+        for j in range(
+            i + 1,
+            len(times)
         ):
 
-            label = "UP"
+            future_time = times[j]
 
-        elif (
-            symbol.startswith("CRASH")
-            and downward_move
-            >= atr * PREDICTION_SPIKE_ATR
-        ):
+            if future_time >= target_start:
+                break
 
-            label = "DOWN"
+            pre_window_indexes.append(j)
 
-        else:
+        early_spike = False
 
-            # For a historical example to be useful,
-            # reject ambiguous/no-spike examples.
-            continue
+        if pre_window_indexes:
 
-        best_future_index = None
+            early_prices = [
+                prices[j]
+                for j in pre_window_indexes
+            ]
 
-        if label == "UP":
+            early_high = max(
+                early_prices
+            )
 
-            for j in future_indexes:
+            early_low = min(
+                early_prices
+            )
+
+            if symbol.startswith("BOOM"):
 
                 if (
-                    prices[j]
+                    early_high
                     - prices[i]
                 ) >= atr * PREDICTION_SPIKE_ATR:
 
-                    best_future_index = j
-                    break
+                    early_spike = True
 
-        else:
-
-            for j in future_indexes:
+            elif symbol.startswith("CRASH"):
 
                 if (
                     prices[i]
-                    - prices[j]
+                    - early_low
                 ) >= atr * PREDICTION_SPIKE_ATR:
 
-                    best_future_index = j
-                    break
+                    early_spike = True
 
-        if best_future_index is None:
+        # ====================================================
+        # If spike already happened before the target window,
+        # this is NOT a valid early-prediction example.
+        # ====================================================
+
+        if early_spike:
             continue
 
-        lead_seconds = (
-            times[best_future_index]
-            - current_time
-        )
+        label = "NO_SPIKE"
+        best_future_index = None
 
-        if not (
-            PREDICTION_MIN_LEAD_SECONDS
-            <= lead_seconds
-            <= PREDICTION_MAX_LEAD_SECONDS
+        if symbol.startswith("BOOM"):
+
+            if (
+                upward_move
+                >= atr * PREDICTION_SPIKE_ATR
+            ):
+
+                label = "UP"
+
+                for j in future_indexes:
+
+                    if (
+                        prices[j]
+                        - prices[i]
+                    ) >= atr * PREDICTION_SPIKE_ATR:
+
+                        best_future_index = j
+                        break
+
+        elif symbol.startswith("CRASH"):
+
+            if (
+                downward_move
+                >= atr * PREDICTION_SPIKE_ATR
+            ):
+
+                label = "DOWN"
+
+                for j in future_indexes:
+
+                    if (
+                        prices[i]
+                        - prices[j]
+                    ) >= atr * PREDICTION_SPIKE_ATR:
+
+                        best_future_index = j
+                        break
+
+        # ====================================================
+        # NEW:
+        # Keep BOTH positive and negative examples.
+        # This was missing before and caused the model to
+        # overestimate spike probability.
+        # ====================================================
+
+        if label in (
+            "UP",
+            "DOWN"
         ):
-            continue
+
+            if best_future_index is None:
+                continue
+
+            lead_seconds = (
+                times[best_future_index]
+                - current_time
+            )
+
+            if not (
+                PREDICTION_MIN_LEAD_SECONDS
+                <= lead_seconds
+                <= PREDICTION_MAX_LEAD_SECONDS
+            ):
+                continue
+
+        else:
+
+            lead_seconds = 0.0
 
         samples.append({
             "compression":
@@ -1715,11 +1785,41 @@ def build_predictive_model(symbol):
                 lead_seconds,
         })
 
-    if len(samples) > PREDICTION_MAX_SAMPLES:
+    # ========================================================
+    # Keep a balanced set of positive / negative examples.
+    # ========================================================
 
-        samples = samples[
-            -PREDICTION_MAX_SAMPLES:
-        ]
+    positive_samples = [
+        sample
+        for sample in samples
+        if sample["label"] in (
+            "UP",
+            "DOWN"
+        )
+    ]
+
+    negative_samples = [
+        sample
+        for sample in samples
+        if sample["label"] == "NO_SPIKE"
+    ]
+
+    positive_samples = positive_samples[
+        -(
+            PREDICTION_MAX_SAMPLES // 2
+        ):
+    ]
+
+    negative_samples = negative_samples[
+        -(
+            PREDICTION_MAX_SAMPLES // 2
+        ):
+    ]
+
+    samples = (
+        positive_samples
+        + negative_samples
+    )
 
     predictive_model[symbol] = {
         "samples": samples,
@@ -1789,6 +1889,30 @@ def predictive_spike_analysis(symbol):
             "lead": 0.0,
         }
 
+    # ========================================================
+    # IMPORTANT:
+    # If the current market is already moving too strongly,
+    # do NOT call it an early prediction.
+    # This prevents a signal at the spike itself.
+    # ========================================================
+
+    current_range_ratio = (
+        current_pattern["range"]
+        / max(
+            current_pattern["atr"],
+            1e-12
+        )
+    )
+
+    if current_range_ratio >= 1.75:
+
+        return {
+            "score": 0.0,
+            "direction": "NONE",
+            "samples": len(samples),
+            "lead": 0.0,
+        }
+
     candidates = []
 
     for sample in samples:
@@ -1801,24 +1925,40 @@ def predictive_spike_analysis(symbol):
             )
         )
 
-        momentum_scale = max(
-            current_pattern["atr"]
-            / max(
-                current_pattern["atr"],
+        # Normalize momentum by ATR.
+        current_momentum_value = (
+            current_pattern["momentum"]
+            * max(
+                abs(
+                    current_pattern["atr"]
+                ),
                 1e-12
-            ),
-            1.0
+            )
+        )
+
+        sample_momentum_value = (
+            sample["momentum"]
+            * max(
+                abs(
+                    sample["atr"]
+                ),
+                1e-12
+            )
+        )
+
+        momentum_scale = max(
+            current_pattern["atr"],
+            sample["atr"],
+            1e-12
         )
 
         momentum_distance = min(
             3.0,
             abs(
-                (
-                    current_pattern["momentum"]
-                    - sample["momentum"]
-                )
-                / momentum_scale
+                current_momentum_value
+                - sample_momentum_value
             )
+            / momentum_scale
         )
 
         range_ratio_current = (
@@ -1877,6 +2017,7 @@ def predictive_spike_analysis(symbol):
     ]
 
     if not nearest:
+
         return {
             "score": 0.0,
             "direction": "NONE",
@@ -1886,9 +2027,12 @@ def predictive_spike_analysis(symbol):
 
     weighted_up = 0.0
     weighted_down = 0.0
+    weighted_negative = 0.0
 
     weighted_total = 0.0
-    weighted_lead = 0.0
+
+    weighted_positive_lead = 0.0
+    weighted_positive_total = 0.0
 
     for distance, sample in nearest:
 
@@ -1899,16 +2043,31 @@ def predictive_spike_analysis(symbol):
 
         weighted_total += weight
 
-        weighted_lead += (
-            sample["lead"]
-            * weight
-        )
-
         if sample["label"] == "UP":
+
             weighted_up += weight
 
+            weighted_positive_lead += (
+                sample["lead"]
+                * weight
+            )
+
+            weighted_positive_total += weight
+
         elif sample["label"] == "DOWN":
+
             weighted_down += weight
+
+            weighted_positive_lead += (
+                sample["lead"]
+                * weight
+            )
+
+            weighted_positive_total += weight
+
+        else:
+
+            weighted_negative += weight
 
     if weighted_total <= 0:
 
@@ -1929,6 +2088,17 @@ def predictive_spike_analysis(symbol):
         / weighted_total
     ) * 100.0
 
+    negative_probability = (
+        weighted_negative
+        / weighted_total
+    ) * 100.0
+
+    # ========================================================
+    # The prediction must beat the NO_SPIKE probability.
+    # This is what prevents every historical positive sample
+    # from automatically becoming a 100% prediction.
+    # ========================================================
+
     if symbol.startswith("BOOM"):
 
         prediction_score = up_probability
@@ -1936,6 +2106,10 @@ def predictive_spike_analysis(symbol):
         if (
             prediction_score
             >= TELEGRAM_SIGNAL_THRESHOLD
+            and prediction_score
+            > negative_probability
+            and prediction_score
+            > down_probability
         ):
 
             direction = "UP_SPIKE"
@@ -1951,6 +2125,10 @@ def predictive_spike_analysis(symbol):
         if (
             prediction_score
             >= TELEGRAM_SIGNAL_THRESHOLD
+            and prediction_score
+            > negative_probability
+            and prediction_score
+            > up_probability
         ):
 
             direction = "DOWN_SPIKE"
@@ -1964,10 +2142,36 @@ def predictive_spike_analysis(symbol):
         prediction_score = 0.0
         direction = "NONE"
 
-    predicted_lead = (
-        weighted_lead
-        / weighted_total
-    )
+    if (
+        weighted_positive_total
+        > 0
+    ):
+
+        predicted_lead = (
+            weighted_positive_lead
+            / weighted_positive_total
+        )
+
+    else:
+
+        predicted_lead = 0.0
+
+    # ========================================================
+    # Final safety gate:
+    # A valid predictive signal must have a historical
+    # positive lead inside the requested 90–150 sec window.
+    # ========================================================
+
+    if direction != "NONE":
+
+        if not (
+            PREDICTION_MIN_LEAD_SECONDS
+            <= predicted_lead
+            <= PREDICTION_MAX_LEAD_SECONDS
+        ):
+
+            direction = "NONE"
+            prediction_score = 0.0
 
     return {
         "score": min(
