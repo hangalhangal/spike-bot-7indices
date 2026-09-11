@@ -509,32 +509,32 @@ async def deriv_ws(symbol, key, app):
                 continue
 
             # ---------------- HISTORY ----------------
-                prices = msg["history"].get("prices", [])
-                times = msg["history"].get("times", [])
+            prices = msg["history"].get("prices", [])
+            times = msg["history"].get("times", [])
 
-                history_data[key] = []
+            history_data[key] = []
 
-                for i, price in enumerate(prices):
-                    try:
-                        ts = float(times[i]) if i < len(times) else 0.0
-                        history_data[key].append((ts, float(price)))
-                    except Exception:
-                        pass
+            for i, price in enumerate(prices):
+                try:
+                    ts = float(times[i]) if i < len(times) else 0.0
+                    history_data[key].append((ts, float(price)))
+                except Exception:
+                    pass
 
-                if history_data[key]:
-                    # Seed live buffer with the latest 500.
-                    for item in history_data[key][-LIVE_HISTORY:]:
-                        ticks_data[key].append(item)
+            if history_data[key]:
+                # Seed live buffer with the latest 500.
+                for item in history_data[key][-LIVE_HISTORY:]:
+                    ticks_data[key].append(item)
 
-                # Warm-up is CPU work; run it in a thread so Telegram
-                # remains responsive.
-                await asyncio.to_thread(warmup_model, key)
-                history_loaded = True
+            # Warm-up is CPU work; run it in a thread so Telegram
+            # remains responsive.
+            await asyncio.to_thread(warmup_model, key)
+            history_loaded = True
 
-                logging.info(
-                    "%s history loaded: %d ticks",
-                    key, len(history_data[key])
-                )
+            logging.info(
+                "%s history loaded: %d ticks",
+                key, len(history_data[key])
+            )
 
         # Subscribe to live ticks only after history/warm-up has completed.
         await ws.send(json.dumps({
