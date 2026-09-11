@@ -483,22 +483,33 @@ async def deriv_ws(symbol, key, app):
             "count": WARMUP_HISTORY,
             "end": "latest",
             "style": "ticks",
+            "subscribe": 0,
+            "req_id": 1000,
         }))
 
-        # Subscribe to live ticks.
-        await ws.send(json.dumps({
-            "ticks": symbol,
-            "subscribe": 1,
-        }))
+        logging.info("%s CONNECTED; waiting for history", key)
 
-        logging.info("%s CONNECTED", key)
-
-        while key in active:
+        # ---------------- HISTORY HANDSHAKE ----------------
+        # Do not start live processing until the historical response has
+        # actually been received. This prevents a missing/errored history
+        # response from silently leaving the model at its old sample count.
+        history_loaded = False
+        while key in active and not history_loaded:
             raw = await ws.recv()
             msg = json.loads(raw)
 
+            if "error" in msg:
+                err = msg.get("error", {})
+                message = str(err.get("message", err))
+                diagnostics[key]["errors"] += 1
+                diagnostics[key]["last_error"] = message
+                logging.error("%s history error: %s", key, message)
+                raise RuntimeError(f"History request failed: {message}")
+
+            if "history" not in msg:
+                continue
+
             # ---------------- HISTORY ----------------
-            if "history" in msg:
                 prices = msg["history"].get("prices", [])
                 times = msg["history"].get("times", [])
 
@@ -519,11 +530,23 @@ async def deriv_ws(symbol, key, app):
                 # Warm-up is CPU work; run it in a thread so Telegram
                 # remains responsive.
                 await asyncio.to_thread(warmup_model, key)
+                history_loaded = True
 
                 logging.info(
                     "%s history loaded: %d ticks",
                     key, len(history_data[key])
                 )
+
+        # Subscribe to live ticks only after history/warm-up has completed.
+        await ws.send(json.dumps({
+            "ticks": symbol,
+            "subscribe": 1,
+        }))
+        logging.info("%s LIVE TICK SUBSCRIBED", key)
+
+        while key in active:
+            raw = await ws.recv()
+            msg = json.loads(raw)
 
             # ---------------- LIVE TICK ----------------
             if "tick" in msg:
