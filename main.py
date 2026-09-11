@@ -51,7 +51,7 @@ MOVE_STRENGTH_LOOKBACK = 20
 # TELEGRAM SIGNAL
 # ============================================================
 
-TELEGRAM_SIGNAL_THRESHOLD = 50.0
+TELEGRAM_SIGNAL_THRESHOLD = 60.0
 
 telegram_chats = set()
 
@@ -2236,31 +2236,51 @@ async def send_telegram_signal(symbol):
     buy = float(sc["buy"])
     sell = float(sc["sell"])
 
+    spike_direction = advanced[symbol][
+        "spike_direction"
+    ]
+
     direction = None
     signal_score = 0.0
 
-    if (
-        buy >= TELEGRAM_SIGNAL_THRESHOLD
-        and buy > sell
-    ):
+    # ========================================================
+    # BOOM = ЗӨВХӨН BUY SPIKE
+    # ========================================================
 
-        direction = "BUY"
-        signal_score = buy
+    if symbol.startswith("BOOM"):
 
-    elif (
-        sell >= TELEGRAM_SIGNAL_THRESHOLD
-        and sell > buy
-    ):
+        if (
+            buy >= TELEGRAM_SIGNAL_THRESHOLD
+            and buy > sell
+            and spike_direction == "UP_SPIKE"
+        ):
 
-        direction = "SELL"
-        signal_score = sell
+            direction = "BUY"
+            signal_score = buy
 
-    else:
+    # ========================================================
+    # CRASH = ЗӨВХӨН SELL SPIKE
+    # ========================================================
+
+    elif symbol.startswith("CRASH"):
+
+        if (
+            sell >= TELEGRAM_SIGNAL_THRESHOLD
+            and sell > buy
+            and spike_direction == "DOWN_SPIKE"
+        ):
+
+            direction = "SELL"
+            signal_score = sell
+
+    # Зөв нөхцөл бүрдээгүй бол сигнал ЯВУУЛАХГҮЙ
+    if direction is None:
 
         last_telegram_signal[symbol] = None
 
         return
 
+    # Нэг чиглэлийн давхардсан сигнал явуулахгүй
     if last_telegram_signal[symbol] == direction:
         return
 
@@ -2278,7 +2298,7 @@ async def send_telegram_signal(symbol):
 
         "👹🧠 AI МАНГАС V5 FIX\n\n"
 
-        f"{emoji} {symbol} {direction}\n\n"
+        f"{emoji} {symbol} {direction} SPIKE\n\n"
 
         f"Signal Score: "
         f"{signal_score:.0f}%\n"
@@ -2288,6 +2308,9 @@ async def send_telegram_signal(symbol):
 
         f"Threshold: "
         f"{TELEGRAM_SIGNAL_THRESHOLD:.0f}%\n\n"
+
+        f"Spike Direction: "
+        f"{spike_direction}\n\n"
 
         f"Decision: "
         f"{sc['decision']}\n"
@@ -2642,7 +2665,12 @@ async def start(
 
         "Telegram BUY/SELL SIGNAL: ON ✅\n"
 
-        "Signal Threshold: 50% 🎯\n\n"
+        f"Signal Threshold: "
+        f"{TELEGRAM_SIGNAL_THRESHOLD:.0f}% 🎯\n\n"
+
+        "BOOM → BUY SPIKE ONLY ✅\n"
+
+        "CRASH → SELL SPIKE ONLY ✅\n\n"
 
         "History → Live Tick → "
         "Features → Structure → "
@@ -2668,6 +2696,8 @@ async def status(
         f"📲 Telegram Signal: ON ✅",
         f"🎯 Signal Threshold: "
         f"{TELEGRAM_SIGNAL_THRESHOLD:.0f}%",
+        "📈 BOOM: BUY SPIKE ONLY",
+        "📉 CRASH: SELL SPIKE ONLY",
         ""
     ]
 
@@ -2899,6 +2929,13 @@ async def status(
 
                 f"Telegram Threshold: "
                 f"{TELEGRAM_SIGNAL_THRESHOLD:.0f}%",
+
+                (
+                    "BOOM Signal: BUY SPIKE ONLY"
+                    if symbol.startswith("BOOM")
+                    else
+                    "CRASH Signal: SELL SPIKE ONLY"
+                ),
             ])
 
         lines.extend([
@@ -2999,7 +3036,12 @@ async def rawstatus(
 
         "TELEGRAM SIGNAL: ON\n"
 
-        "TELEGRAM THRESHOLD: 50%"
+        f"TELEGRAM THRESHOLD: "
+        f"{TELEGRAM_SIGNAL_THRESHOLD:.0f}%\n\n"
+
+        "BOOM → BUY SPIKE ONLY\n"
+
+        "CRASH → SELL SPIKE ONLY"
     )
 
 
