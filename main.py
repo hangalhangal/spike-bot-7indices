@@ -47,6 +47,21 @@ SWING_RIGHT = 5
 
 MOVE_STRENGTH_LOOKBACK = 20
 
+# ============================================================
+# TELEGRAM SIGNAL
+# ============================================================
+
+TELEGRAM_SIGNAL_THRESHOLD = 50.0
+
+telegram_chats = set()
+
+last_telegram_signal = {
+    symbol: None
+    for symbol in INDICES
+}
+
+# ============================================================
+
 active = set()
 tasks = {}
 
@@ -1419,14 +1434,6 @@ def calculate_spike_analysis(symbol):
 
         compression_ratio = 1.0
 
-    # ========================================================
-    # RANGE EXPANSION NORMALIZATION FIX
-    # Compare the latest 10-tick movement with previous
-    # 10-tick movement blocks.
-    # This avoids comparing a 10-tick move against a
-    # 1-tick ATR.
-    # ========================================================
-
     block_size = 10
 
     recent_changes = []
@@ -1684,12 +1691,6 @@ def calculate_signal_score(symbol):
         component_buy["trend"] = 0.0
         component_sell["trend"] = 0.0
 
-    # ========================================================
-    # RSI CONFIRMATION FIX
-    # RSI can ONLY confirm the existing direction.
-    # RSI can NEVER create an opposite-direction score.
-    # ========================================================
-
     momentum = f["momentum10"]
 
     rsi = f["rsi14"]
@@ -1733,9 +1734,6 @@ def calculate_signal_score(symbol):
 
             sell += 6.0
             component_sell["rsi"] = 6.0
-
-    # RSI 30-70 = NO RSI SCORE
-    # RSI conflicts with trend/momentum = NO RSI SCORE
 
     if momentum > 0:
 
@@ -2224,6 +2222,98 @@ def calculate_features(symbol):
     return True
 
 
+# ============================================================
+# TELEGRAM SIGNAL SENDER
+# ============================================================
+
+async def send_telegram_signal(symbol):
+
+    if not telegram_chats:
+        return
+
+    sc = score[symbol]
+
+    buy = float(sc["buy"])
+    sell = float(sc["sell"])
+
+    direction = None
+    signal_score = 0.0
+
+    if (
+        buy >= TELEGRAM_SIGNAL_THRESHOLD
+        and buy > sell
+    ):
+
+        direction = "BUY"
+        signal_score = buy
+
+    elif (
+        sell >= TELEGRAM_SIGNAL_THRESHOLD
+        and sell > buy
+    ):
+
+        direction = "SELL"
+        signal_score = sell
+
+    else:
+
+        last_telegram_signal[symbol] = None
+
+        return
+
+    if last_telegram_signal[symbol] == direction:
+        return
+
+    last_telegram_signal[symbol] = direction
+
+    if direction == "BUY":
+
+        emoji = "🟢"
+
+    else:
+
+        emoji = "🔴"
+
+    message = (
+
+        "👹🧠 AI МАНГАС V5 FIX\n\n"
+
+        f"{emoji} {symbol} {direction}\n\n"
+
+        f"Signal Score: "
+        f"{signal_score:.0f}%\n"
+
+        f"BUY: {buy:.0f}%\n"
+        f"SELL: {sell:.0f}%\n\n"
+
+        f"Threshold: "
+        f"{TELEGRAM_SIGNAL_THRESHOLD:.0f}%\n\n"
+
+        f"Decision: "
+        f"{sc['decision']}\n"
+
+        f"Strength: "
+        f"{sc['strength']}"
+    )
+
+    for chat_id in list(telegram_chats):
+
+        try:
+
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=message
+            )
+
+        except Exception as e:
+
+            logging.error(
+                "Telegram signal error [%s]: %s",
+                symbol,
+                str(e)
+            )
+
+
 def process_history(
     symbol,
     prices,
@@ -2455,9 +2545,15 @@ async def deriv_worker(symbol):
 
                     diag[symbol]["ticks"] += 1
 
-                    calculate_features(
+                    feature_ready = calculate_features(
                         symbol
                     )
+
+                    if feature_ready:
+
+                        await send_telegram_signal(
+                            symbol
+                        )
 
                     diag[symbol]["stage"] = "LIVE"
 
@@ -2512,6 +2608,12 @@ async def start(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    if update.effective_chat:
+
+        telegram_chats.add(
+            update.effective_chat.id
+        )
+
     for symbol in INDICES:
 
         start_index(symbol)
@@ -2538,13 +2640,14 @@ async def start(
 
         "SIGNAL SCORE ENGINE V1 ON ✅\n\n"
 
-        "⚠️ SCORE ONLY MODE\n"
+        "Telegram BUY/SELL SIGNAL: ON ✅\n"
 
-        "Telegram BUY/SELL SIGNAL: OFF ❌\n\n"
+        "Signal Threshold: 50% 🎯\n\n"
 
         "History → Live Tick → "
         "Features → Structure → "
-        "Advanced Analysis → Score\n\n"
+        "Advanced Analysis → Score → "
+        "Telegram Signal\n\n"
 
         "/status"
     )
@@ -2561,6 +2664,10 @@ async def status(
         "",
         "🧠 FEATURE + MARKET STRUCTURE + SCORE",
         "==============================",
+        "",
+        f"📲 Telegram Signal: ON ✅",
+        f"🎯 Signal Threshold: "
+        f"{TELEGRAM_SIGNAL_THRESHOLD:.0f}%",
         ""
     ]
 
@@ -2788,7 +2895,10 @@ async def status(
                 f"Spike: "
                 f"{sc['spike']:.0f}",
 
-                "Telegram Signal: OFF ❌",
+                "Telegram Signal: ON ✅",
+
+                f"Telegram Threshold: "
+                f"{TELEGRAM_SIGNAL_THRESHOLD:.0f}%",
             ])
 
         lines.extend([
@@ -2887,7 +2997,9 @@ async def rawstatus(
 
         "SIGNAL SCORE V1 ON\n"
 
-        "TELEGRAM SIGNAL: OFF"
+        "TELEGRAM SIGNAL: ON\n"
+
+        "TELEGRAM THRESHOLD: 50%"
     )
 
 
