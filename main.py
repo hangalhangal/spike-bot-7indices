@@ -772,7 +772,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"WIN: {ok} | LOSS: {fail}\n"
             f"WinRate: {wr:.1f}%\n"
             f"Pending: {len(pending_predictions[key])} | Candidates: {diagnostics[key]['candidates']}\n"
-            f"Signals: {diagnostics[key]['signals']} | Errors: {diagnostics[key]['errors']}\n\n"
+            f"Signals: {diagnostics[key]['signals']} | Errors: {diagnostics[key]['errors']}\n"
+            f"Last error: {diagnostics[key]['last_error'] or '-'}\n\n"
         )
 
     msg += (
