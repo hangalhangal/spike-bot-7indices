@@ -108,7 +108,7 @@ for key in INDICES:
     recent_results[key] = deque(maxlen=RECENT_RESULTS)
     pending_predictions[key] = []
     last_signal_time[key] = 0.0
-    diagnostics[key] = {"ticks": 0, "features": 0, "candidates": 0, "signals": 0, "blocked_confidence": 0, "blocked_direction": 0, "blocked_cooldown": 0, "blocked_training": 0, "errors": 0, "last_error": "", "last_tick": 0.0, "last_confidence": 0.0}
+    diagnostics[key] = {"ticks": 0, "features": 0, "candidates": 0, "signals": 0, "blocked_confidence": 0, "blocked_direction": 0, "blocked_cooldown": 0, "blocked_training": 0, "errors": 0, "last_error": "", "last_tick": 0.0, "last_confidence": 0.0, "pred_no_spike": 0, "pred_up": 0, "pred_down": 0}
 
 
 # ============================================================
@@ -589,6 +589,12 @@ async def deriv_ws(symbol, key, app):
                     features
                 )
                 diagnostics[key]["last_confidence"] = confidence
+                if predicted_class == 0:
+                    diagnostics[key]["pred_no_spike"] += 1
+                elif predicted_class == 1:
+                    diagnostics[key]["pred_up"] += 1
+                elif predicted_class == 2:
+                    diagnostics[key]["pred_down"] += 1
                 if predicted_class != 0:
                     diagnostics[key]["candidates"] += 1
 
@@ -771,8 +777,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"AI Training: {m['samples']}\n"
             f"WIN: {ok} | LOSS: {fail}\n"
             f"WinRate: {wr:.1f}%\n"
-            f"Pending: {len(pending_predictions[key])} | Candidates: {diagnostics[key]['candidates']}\n"
-            f"Signals: {diagnostics[key]['signals']} | Errors: {diagnostics[key]['errors']}\n"
+            f"Features: {diagnostics[key]['features']} | Candidates: {diagnostics[key]['candidates']}\n"
+            f"Pred: NO {diagnostics[key]['pred_no_spike']} | UP {diagnostics[key]['pred_up']} | DOWN {diagnostics[key]['pred_down']}\n"
+            f"Pending: {len(pending_predictions[key])} | Signals: {diagnostics[key]['signals']} | Errors: {diagnostics[key]['errors']}\n"
             f"Last error: {diagnostics[key]['last_error'] or '-'}\n\n"
         )
 
