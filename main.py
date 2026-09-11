@@ -471,15 +471,16 @@ async def send_signal(app, key, direction, confidence, probabilities):
 async def deriv_ws(symbol, key, app):
     uri = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
+    # ========================================================
+    # 1) HISTORY WEBSOCKET — load/warm-up, then close it
+    # ========================================================
     async with websockets.connect(
         uri,
         ping_interval=20,
         ping_timeout=None,
         close_timeout=10,
-    ) as ws:
-
-        # 5000 ticks for historical warm-up.
-        await ws.send(json.dumps({
+    ) as history_ws:
+        await history_ws.send(json.dumps({
             "ticks_history": symbol,
             "count": WARMUP_HISTORY,
             "end": "latest",
@@ -487,15 +488,11 @@ async def deriv_ws(symbol, key, app):
             "req_id": 1000,
         }))
 
-        logging.info("%s CONNECTED; waiting for history", key)
-
-        # ---------------- HISTORY HANDSHAKE ----------------
-        # Do not start live processing until the historical response has
-        # actually been received. This prevents a missing/errored history
-        # response from silently leaving the model at its old sample count.
+        logging.info("%s HISTORY WS CONNECTED; waiting for history", key)
         history_loaded = False
+
         while key in active and not history_loaded:
-            raw = await ws.recv()
+            raw = await history_ws.recv()
             msg = json.loads(raw)
 
             if "error" in msg:
@@ -509,10 +506,8 @@ async def deriv_ws(symbol, key, app):
             if "history" not in msg:
                 continue
 
-            # ---------------- HISTORY ----------------
             prices = msg["history"].get("prices", [])
             times = msg["history"].get("times", [])
-
             history_data[key] = []
 
             for i, price in enumerate(prices):
@@ -522,106 +517,116 @@ async def deriv_ws(symbol, key, app):
                 except Exception:
                     pass
 
+            ticks_data[key].clear()
             if history_data[key]:
-                # Seed live buffer with the latest 500.
                 for item in history_data[key][-LIVE_HISTORY:]:
                     ticks_data[key].append(item)
 
-            # Warm-up is CPU work; run it in a thread so Telegram
-            # remains responsive.
             await asyncio.to_thread(warmup_model, key)
             history_loaded = True
-
             logging.info(
-                "%s history loaded: %d ticks",
-                key, len(history_data[key])
+                "%s history loaded: %d ticks; training=%d",
+                key,
+                len(history_data[key]),
+                models[key]["samples"],
             )
 
-        # Subscribe to live ticks only after history/warm-up has completed.
-        await ws.send(json.dumps({
+    # ========================================================
+    # 2) NEW LIVE WEBSOCKET — separate connection for live ticks
+    # ========================================================
+    async with websockets.connect(
+        uri,
+        ping_interval=20,
+        ping_timeout=None,
+        close_timeout=10,
+    ) as live_ws:
+        await live_ws.send(json.dumps({
             "ticks": symbol,
             "subscribe": 1,
+            "req_id": 3000,
         }))
-        logging.info("%s LIVE TICK SUBSCRIBED", key)
+        logging.info("%s LIVE WS CONNECTED; tick subscription requested", key)
 
         while key in active:
-            raw = await ws.recv()
+            raw = await live_ws.recv()
             msg = json.loads(raw)
 
-            # ---------------- LIVE TICK ----------------
-            if "tick" in msg:
-                tick = msg["tick"]
+            if "error" in msg:
+                err = msg.get("error", {})
+                message = str(err.get("message", err))
+                diagnostics[key]["errors"] += 1
+                diagnostics[key]["last_error"] = message
+                logging.error("%s live websocket error: %s", key, message)
+                continue
 
-                try:
-                    price = float(tick["quote"])
-                    timestamp = float(tick.get("epoch", time.time()))
-                except Exception:
-                    continue
+            if "tick" not in msg:
+                continue
 
-                ticks_data[key].append((timestamp, price))
+            tick = msg["tick"]
+            try:
+                price = float(tick["quote"])
+                timestamp = float(tick.get("epoch", time.time()))
+            except Exception:
+                continue
 
-                prices = [x[1] for x in ticks_data[key]]
+            ticks_data[key].append((timestamp, price))
 
-                if len(prices) < 210:
-                    continue
+            prices = [x[1] for x in ticks_data[key]]
+            if len(prices) < 210:
+                continue
 
-                await evaluate_predictions(
-                    key,
-                    timestamp,
-                    price,
-                )
+            await evaluate_predictions(key, timestamp, price)
 
-                try:
-                    features = calculate_features(prices)
-                except Exception as e:
-                    diagnostics[key]["errors"] += 1
-                    diagnostics[key]["last_error"] = str(e)
-                    logging.error("%s feature error: %s", key, e)
-                    continue
+            try:
+                features = calculate_features(prices)
+            except Exception as e:
+                diagnostics[key]["errors"] += 1
+                diagnostics[key]["last_error"] = str(e)
+                logging.error("%s feature error: %s", key, e)
+                continue
 
-                if features is None:
-                    continue
+            if features is None:
+                continue
 
-                diagnostics[key]["features"] += 1
+            diagnostics[key]["features"] += 1
 
-                predicted_class, confidence, probabilities = predict(
-                    key,
-                    features
-                )
-                diagnostics[key]["last_confidence"] = confidence
-                if predicted_class != 0:
-                    diagnostics[key]["candidates"] += 1
+            predicted_class, confidence, probabilities = predict(
+                key,
+                features
+            )
+            diagnostics[key]["last_confidence"] = confidence
 
-                if not signal_allowed(
-                    key,
-                    predicted_class,
-                    confidence,
-                    features,
-                ):
-                    continue
+            if predicted_class != 0:
+                diagnostics[key]["candidates"] += 1
 
-                direction = "BUY" if predicted_class == 1 else "SELL"
+            if not signal_allowed(
+                key,
+                predicted_class,
+                confidence,
+                features,
+            ):
+                continue
 
-                # Save the prediction so the model can learn from
-                # the actual result after 60 seconds.
-                pending_predictions[key].append({
-                    "time": timestamp,
-                    "price": price,
-                    "direction": direction,
-                    "features": features,
-                    "confidence": confidence,
-                })
+            direction = "BUY" if predicted_class == 1 else "SELL"
 
-                last_signal_time[key] = time.time()
-                diagnostics[key]["signals"] += 1
+            pending_predictions[key].append({
+                "time": timestamp,
+                "price": price,
+                "direction": direction,
+                "features": features,
+                "confidence": confidence,
+            })
 
-                await send_signal(
-                    app,
-                    key,
-                    direction,
-                    confidence,
-                    probabilities,
-                )
+            last_signal_time[key] = time.time()
+            diagnostics[key]["signals"] += 1
+
+            await send_signal(
+                app,
+                key,
+                direction,
+                confidence,
+                probabilities,
+            )
 
 
 async def start_ws(symbol, key, app):
