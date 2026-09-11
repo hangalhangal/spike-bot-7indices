@@ -61,6 +61,25 @@ last_telegram_signal = {
 }
 
 # ============================================================
+# PREDICTIVE SPIKE SETTINGS
+# ============================================================
+
+PREDICTION_MIN_LEAD_SECONDS = 90.0
+PREDICTION_MAX_LEAD_SECONDS = 150.0
+PREDICTION_SPIKE_ATR = 2.5
+PREDICTION_MIN_SAMPLES = 8
+PREDICTION_MAX_SAMPLES = 40
+PREDICTION_REFRESH_TICKS = 300
+
+predictive_model = {
+    symbol: {
+        "samples": [],
+        "built_ticks": 0,
+    }
+    for symbol in INDICES
+}
+
+# ============================================================
 
 active = set()
 tasks = {}
@@ -131,6 +150,12 @@ advanced = {
         "spike_direction": "NONE",
         "compression": 0.0,
         "range_expansion": 0.0,
+
+        # Predictive fields
+        "prediction_score": 0.0,
+        "prediction_direction": "NONE",
+        "prediction_samples": 0,
+        "prediction_lead": 0.0,
     }
     for symbol in INDICES
 }
@@ -251,6 +276,11 @@ def reset_diag(symbol):
         "spike_direction": "NONE",
         "compression": 0.0,
         "range_expansion": 0.0,
+
+        "prediction_score": 0.0,
+        "prediction_direction": "NONE",
+        "prediction_samples": 0,
+        "prediction_lead": 0.0,
     }
 
     score[symbol] = {
@@ -270,6 +300,11 @@ def reset_diag(symbol):
         "spike": 0.0,
         "decision": "WAIT",
         "strength": "LOW",
+    }
+
+    predictive_model[symbol] = {
+        "samples": [],
+        "built_ticks": 0,
     }
 
     ticks[symbol].clear()
@@ -1346,6 +1381,605 @@ def calculate_fvg(symbol):
     }
 
 
+# ============================================================
+# PREDICTIVE SPIKE ENGINE
+# ============================================================
+
+def prediction_pattern(
+    prices,
+    index
+):
+
+    if index < 45:
+        return None
+
+    if index >= len(prices):
+        return None
+
+    current = prices[index]
+
+    if current == 0:
+        return None
+
+    atr_start = max(
+        1,
+        index - 14
+    )
+
+    atr_changes = []
+
+    for i in range(
+        atr_start,
+        index + 1
+    ):
+
+        if i <= 0:
+            continue
+
+        atr_changes.append(
+            abs(
+                prices[i]
+                - prices[i - 1]
+            )
+        )
+
+    if not atr_changes:
+        return None
+
+    atr = (
+        sum(atr_changes)
+        / len(atr_changes)
+    )
+
+    if atr <= 0:
+        return None
+
+    short_start = max(
+        1,
+        index - 10
+    )
+
+    long_start = max(
+        1,
+        index - 40
+    )
+
+    short_changes = [
+        abs(
+            prices[i]
+            - prices[i - 1]
+        )
+        for i in range(
+            short_start,
+            index + 1
+        )
+    ]
+
+    long_changes = [
+        abs(
+            prices[i]
+            - prices[i - 1]
+        )
+        for i in range(
+            long_start,
+            index + 1
+        )
+    ]
+
+    if not short_changes or not long_changes:
+        return None
+
+    short_avg = (
+        sum(short_changes)
+        / len(short_changes)
+    )
+
+    long_avg = (
+        sum(long_changes)
+        / len(long_changes)
+    )
+
+    if long_avg <= 0:
+        compression = 1.0
+    else:
+        compression = (
+            short_avg
+            / long_avg
+        )
+
+    momentum_start = max(
+        0,
+        index - 10
+    )
+
+    old_price = prices[
+        momentum_start
+    ]
+
+    if old_price == 0:
+        momentum = 0.0
+    else:
+        momentum = (
+            (
+                current
+                - old_price
+            )
+            / old_price
+        )
+
+    recent_range = sum(
+        short_changes
+    )
+
+    return {
+        "compression": compression,
+        "momentum": momentum,
+        "range": recent_range,
+        "atr": atr,
+    }
+
+
+def build_predictive_model(symbol):
+
+    data = list(
+        ticks[symbol]
+    )
+
+    if len(data) < 250:
+        return
+
+    prices = [
+        float(item[1])
+        for item in data
+    ]
+
+    times = [
+        float(item[0])
+        for item in data
+    ]
+
+    samples = []
+
+    start_index = 50
+
+    end_index = (
+        len(prices)
+        - 20
+    )
+
+    if end_index <= start_index:
+        return
+
+    # Use historical points spaced apart.
+    # Their future outcome is known only for these
+    # historical points, never for the current tick.
+    step = 8
+
+    for i in range(
+        start_index,
+        end_index,
+        step
+    ):
+
+        pattern = prediction_pattern(
+            prices,
+            i
+        )
+
+        if pattern is None:
+            continue
+
+        current_time = times[i]
+
+        if current_time <= 0:
+            continue
+
+        target_start = (
+            current_time
+            + PREDICTION_MIN_LEAD_SECONDS
+        )
+
+        target_end = (
+            current_time
+            + PREDICTION_MAX_LEAD_SECONDS
+        )
+
+        future_indexes = []
+
+        for j in range(
+            i + 1,
+            len(times)
+        ):
+
+            future_time = times[j]
+
+            if future_time < target_start:
+                continue
+
+            if future_time > target_end:
+                break
+
+            future_indexes.append(j)
+
+        if not future_indexes:
+            continue
+
+        future_prices = [
+            prices[j]
+            for j in future_indexes
+        ]
+
+        future_high = max(
+            future_prices
+        )
+
+        future_low = min(
+            future_prices
+        )
+
+        atr = pattern["atr"]
+
+        if atr <= 0:
+            continue
+
+        upward_move = (
+            future_high
+            - prices[i]
+        )
+
+        downward_move = (
+            prices[i]
+            - future_low
+        )
+
+        if (
+            symbol.startswith("BOOM")
+            and upward_move
+            >= atr * PREDICTION_SPIKE_ATR
+        ):
+
+            label = "UP"
+
+        elif (
+            symbol.startswith("CRASH")
+            and downward_move
+            >= atr * PREDICTION_SPIKE_ATR
+        ):
+
+            label = "DOWN"
+
+        else:
+
+            # For a historical example to be useful,
+            # reject ambiguous/no-spike examples.
+            continue
+
+        best_future_index = None
+
+        if label == "UP":
+
+            for j in future_indexes:
+
+                if (
+                    prices[j]
+                    - prices[i]
+                ) >= atr * PREDICTION_SPIKE_ATR:
+
+                    best_future_index = j
+                    break
+
+        else:
+
+            for j in future_indexes:
+
+                if (
+                    prices[i]
+                    - prices[j]
+                ) >= atr * PREDICTION_SPIKE_ATR:
+
+                    best_future_index = j
+                    break
+
+        if best_future_index is None:
+            continue
+
+        lead_seconds = (
+            times[best_future_index]
+            - current_time
+        )
+
+        if not (
+            PREDICTION_MIN_LEAD_SECONDS
+            <= lead_seconds
+            <= PREDICTION_MAX_LEAD_SECONDS
+        ):
+            continue
+
+        samples.append({
+            "compression":
+                pattern["compression"],
+
+            "momentum":
+                pattern["momentum"],
+
+            "range":
+                pattern["range"],
+
+            "atr":
+                pattern["atr"],
+
+            "label":
+                label,
+
+            "lead":
+                lead_seconds,
+        })
+
+    if len(samples) > PREDICTION_MAX_SAMPLES:
+
+        samples = samples[
+            -PREDICTION_MAX_SAMPLES:
+        ]
+
+    predictive_model[symbol] = {
+        "samples": samples,
+        "built_ticks": diag[symbol]["ticks"],
+    }
+
+
+def predictive_spike_analysis(symbol):
+
+    data = list(
+        ticks[symbol]
+    )
+
+    if len(data) < 250:
+
+        return {
+            "score": 0.0,
+            "direction": "NONE",
+            "samples": 0,
+            "lead": 0.0,
+        }
+
+    model = predictive_model[symbol]
+
+    if (
+        not model["samples"]
+        or (
+            diag[symbol]["ticks"]
+            - model["built_ticks"]
+            >= PREDICTION_REFRESH_TICKS
+        )
+    ):
+
+        build_predictive_model(
+            symbol
+        )
+
+        model = predictive_model[symbol]
+
+    samples = model["samples"]
+
+    if len(samples) < PREDICTION_MIN_SAMPLES:
+
+        return {
+            "score": 0.0,
+            "direction": "NONE",
+            "samples": len(samples),
+            "lead": 0.0,
+        }
+
+    prices = [
+        float(item[1])
+        for item in data
+    ]
+
+    current_pattern = prediction_pattern(
+        prices,
+        len(prices) - 1
+    )
+
+    if current_pattern is None:
+
+        return {
+            "score": 0.0,
+            "direction": "NONE",
+            "samples": len(samples),
+            "lead": 0.0,
+        }
+
+    candidates = []
+
+    for sample in samples:
+
+        compression_distance = min(
+            3.0,
+            abs(
+                current_pattern["compression"]
+                - sample["compression"]
+            )
+        )
+
+        momentum_scale = max(
+            current_pattern["atr"]
+            / max(
+                current_pattern["atr"],
+                1e-12
+            ),
+            1.0
+        )
+
+        momentum_distance = min(
+            3.0,
+            abs(
+                (
+                    current_pattern["momentum"]
+                    - sample["momentum"]
+                )
+                / momentum_scale
+            )
+        )
+
+        range_ratio_current = (
+            current_pattern["range"]
+            / max(
+                current_pattern["atr"],
+                1e-12
+            )
+        )
+
+        range_ratio_sample = (
+            sample["range"]
+            / max(
+                sample["atr"],
+                1e-12
+            )
+        )
+
+        range_distance = min(
+            3.0,
+            abs(
+                range_ratio_current
+                - range_ratio_sample
+            )
+        )
+
+        distance = (
+            compression_distance
+            * 0.45
+            +
+            momentum_distance
+            * 0.30
+            +
+            range_distance
+            * 0.25
+        )
+
+        candidates.append(
+            (
+                distance,
+                sample
+            )
+        )
+
+    candidates.sort(
+        key=lambda item: item[0]
+    )
+
+    nearest_count = min(
+        12,
+        len(candidates)
+    )
+
+    nearest = candidates[
+        :nearest_count
+    ]
+
+    if not nearest:
+        return {
+            "score": 0.0,
+            "direction": "NONE",
+            "samples": len(samples),
+            "lead": 0.0,
+        }
+
+    weighted_up = 0.0
+    weighted_down = 0.0
+
+    weighted_total = 0.0
+    weighted_lead = 0.0
+
+    for distance, sample in nearest:
+
+        weight = 1.0 / (
+            0.20
+            + distance
+        )
+
+        weighted_total += weight
+
+        weighted_lead += (
+            sample["lead"]
+            * weight
+        )
+
+        if sample["label"] == "UP":
+            weighted_up += weight
+
+        elif sample["label"] == "DOWN":
+            weighted_down += weight
+
+    if weighted_total <= 0:
+
+        return {
+            "score": 0.0,
+            "direction": "NONE",
+            "samples": len(samples),
+            "lead": 0.0,
+        }
+
+    up_probability = (
+        weighted_up
+        / weighted_total
+    ) * 100.0
+
+    down_probability = (
+        weighted_down
+        / weighted_total
+    ) * 100.0
+
+    if symbol.startswith("BOOM"):
+
+        prediction_score = up_probability
+
+        if (
+            prediction_score
+            >= TELEGRAM_SIGNAL_THRESHOLD
+        ):
+
+            direction = "UP_SPIKE"
+
+        else:
+
+            direction = "NONE"
+
+    elif symbol.startswith("CRASH"):
+
+        prediction_score = down_probability
+
+        if (
+            prediction_score
+            >= TELEGRAM_SIGNAL_THRESHOLD
+        ):
+
+            direction = "DOWN_SPIKE"
+
+        else:
+
+            direction = "NONE"
+
+    else:
+
+        prediction_score = 0.0
+        direction = "NONE"
+
+    predicted_lead = (
+        weighted_lead
+        / weighted_total
+    )
+
+    return {
+        "score": min(
+            100.0,
+            prediction_score
+        ),
+        "direction": direction,
+        "samples": len(samples),
+        "lead": predicted_lead,
+    }
+
+
 def calculate_spike_analysis(symbol):
 
     prices = [
@@ -1360,6 +1994,10 @@ def calculate_spike_analysis(symbol):
             "direction": "NONE",
             "compression": 0.0,
             "expansion": 0.0,
+            "prediction_score": 0.0,
+            "prediction_direction": "NONE",
+            "prediction_samples": 0,
+            "prediction_lead": 0.0,
         }
 
     atr = features[symbol]["atr14"]
@@ -1371,6 +2009,10 @@ def calculate_spike_analysis(symbol):
             "direction": "NONE",
             "compression": 0.0,
             "expansion": 0.0,
+            "prediction_score": 0.0,
+            "prediction_direction": "NONE",
+            "prediction_samples": 0,
+            "prediction_lead": 0.0,
         }
 
     short_changes = []
@@ -1578,11 +2220,31 @@ def calculate_spike_analysis(symbol):
         score_value
     )
 
+    # ========================================================
+    # NEW: FUTURE SPIKE PREDICTION
+    # ========================================================
+
+    prediction = predictive_spike_analysis(
+        symbol
+    )
+
     return {
         "score": score_value,
         "direction": direction,
         "compression": compression_ratio,
         "expansion": expansion_ratio,
+
+        "prediction_score":
+            prediction["score"],
+
+        "prediction_direction":
+            prediction["direction"],
+
+        "prediction_samples":
+            prediction["samples"],
+
+        "prediction_lead":
+            prediction["lead"],
     }
 
 
@@ -1658,6 +2320,22 @@ def calculate_advanced_analysis(symbol):
 
     advanced[symbol]["range_expansion"] = (
         spike["expansion"]
+    )
+
+    advanced[symbol]["prediction_score"] = (
+        spike["prediction_score"]
+    )
+
+    advanced[symbol]["prediction_direction"] = (
+        spike["prediction_direction"]
+    )
+
+    advanced[symbol]["prediction_samples"] = (
+        spike["prediction_samples"]
+    )
+
+    advanced[symbol]["prediction_lead"] = (
+        spike["prediction_lead"]
     )
 
 
@@ -2236,42 +2914,74 @@ async def send_telegram_signal(symbol):
     buy = float(sc["buy"])
     sell = float(sc["sell"])
 
-    spike_direction = advanced[symbol][
-        "spike_direction"
+    # ========================================================
+    # NEW PREDICTIVE SIGNAL
+    # ========================================================
+
+    prediction_direction = advanced[symbol][
+        "prediction_direction"
     ]
+
+    prediction_score = float(
+        advanced[symbol][
+            "prediction_score"
+        ]
+    )
+
+    prediction_lead = float(
+        advanced[symbol][
+            "prediction_lead"
+        ]
+    )
+
+    prediction_samples = int(
+        advanced[symbol][
+            "prediction_samples"
+        ]
+    )
 
     direction = None
     signal_score = 0.0
 
     # ========================================================
-    # BOOM = ЗӨВХӨН BUY SPIKE
+    # BOOM = ЗӨВХӨН BUY
+    # Урьдчилан таамагласан UP SPIKE үед
     # ========================================================
 
     if symbol.startswith("BOOM"):
 
         if (
-            buy >= TELEGRAM_SIGNAL_THRESHOLD
+            prediction_score
+            >= TELEGRAM_SIGNAL_THRESHOLD
+            and prediction_direction
+            == "UP_SPIKE"
             and buy > sell
-            and spike_direction == "UP_SPIKE"
+            and prediction_samples
+            >= PREDICTION_MIN_SAMPLES
         ):
 
             direction = "BUY"
-            signal_score = buy
+            signal_score = prediction_score
 
     # ========================================================
-    # CRASH = ЗӨВХӨН SELL SPIKE
+    # CRASH = ЗӨВХӨН SELL
+    # Урьдчилан таамагласан DOWN SPIKE үед
     # ========================================================
 
     elif symbol.startswith("CRASH"):
 
         if (
-            sell >= TELEGRAM_SIGNAL_THRESHOLD
+            prediction_score
+            >= TELEGRAM_SIGNAL_THRESHOLD
+            and prediction_direction
+            == "DOWN_SPIKE"
             and sell > buy
-            and spike_direction == "DOWN_SPIKE"
+            and prediction_samples
+            >= PREDICTION_MIN_SAMPLES
         ):
 
             direction = "SELL"
-            signal_score = sell
+            signal_score = prediction_score
 
     # Зөв нөхцөл бүрдээгүй бол сигнал ЯВУУЛАХГҮЙ
     if direction is None:
@@ -2294,6 +3004,7 @@ async def send_telegram_signal(symbol):
 
         emoji = "🔴"
 
+    # Message format-ийг өөрчлөөгүй
     message = (
 
         "👹🧠 AI МАНГАС V5 FIX\n\n"
@@ -2310,7 +3021,7 @@ async def send_telegram_signal(symbol):
         f"{TELEGRAM_SIGNAL_THRESHOLD:.0f}%\n\n"
 
         f"Spike Direction: "
-        f"{spike_direction}\n\n"
+        f"{prediction_direction}\n\n"
 
         f"Decision: "
         f"{sc['decision']}\n"
@@ -2400,6 +3111,11 @@ def process_history(
     diag[symbol]["training"] = min(
         len(prices),
         TRAINING_COUNT
+    )
+
+    # Historical model is built from past data.
+    build_predictive_model(
+        symbol
     )
 
     calculate_features(
