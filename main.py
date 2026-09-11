@@ -483,7 +483,6 @@ async def deriv_ws(symbol, key, app):
             "count": WARMUP_HISTORY,
             "end": "latest",
             "style": "ticks",
-            "subscribe": 0,
             "req_id": 1000,
         }))
 
